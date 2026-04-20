@@ -210,9 +210,34 @@ const listPurchaseRequests = async (req, res) => {
     const params = parseListParams(req.query, { defaultSortBy: "created_at", defaultOrder: "DESC" });
     const { sortBy, order } = pickSort(params, ["created_at", "request_number", "status"], "created_at");
 
+    const statusFilter = String(req.query?.status || "").trim().toLowerCase();
+    const allowedStatuses = new Set(["pending", "approved", "rejected"]);
+    const status = allowedStatuses.has(statusFilter) ? statusFilter : "";
+
+    const isPoCreatedRaw = req.query?.is_po_created;
+    const hasIsPoCreated =
+      isPoCreatedRaw === "true" || isPoCreatedRaw === "false" || isPoCreatedRaw === true || isPoCreatedRaw === false;
+    const isPoCreated = String(isPoCreatedRaw) === "true";
+
     const hasSearch = Boolean(params.search);
-    const where = hasSearch ? "WHERE pr.request_number ILIKE $1 OR s.name ILIKE $1" : "";
-    const countArgs = hasSearch ? [`%${params.search}%`] : [];
+
+    const whereParts = [];
+    const args = [];
+
+    if (hasSearch) {
+      args.push(`%${params.search}%`);
+      whereParts.push(`(pr.request_number ILIKE $${args.length} OR s.name ILIKE $${args.length})`);
+    }
+    if (status) {
+      args.push(status);
+      whereParts.push(`pr.status = $${args.length}`);
+    }
+    if (hasIsPoCreated) {
+      args.push(isPoCreated);
+      whereParts.push(`pr.is_po_created = $${args.length}`);
+    }
+
+    const where = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
 
     const totalResult = await req.tenantDB.query(
       `
@@ -221,13 +246,13 @@ const listPurchaseRequests = async (req, res) => {
       JOIN suppliers s ON s.id = pr.supplier_id
       ${where}
       `,
-      countArgs
+      args
     );
     const total = totalResult.rows[0]?.total ?? 0;
 
-    const dataArgs = hasSearch
-      ? [`%${params.search}%`, params.limit, params.offset]
-      : [params.limit, params.offset];
+    const dataArgs = [...args, params.limit, params.offset];
+    const limitIdx = dataArgs.length - 1;
+    const offsetIdx = dataArgs.length;
 
     const result = await req.tenantDB.query(
       `
@@ -235,6 +260,7 @@ const listPurchaseRequests = async (req, res) => {
         pr.id,
         pr.request_number,
         pr.status,
+        pr.is_po_created,
         pr.remarks,
         pr.created_at,
         pr.updated_at,
@@ -250,7 +276,7 @@ const listPurchaseRequests = async (req, res) => {
       ) ic ON ic.purchase_request_id = pr.id
       ${where}
       ORDER BY pr.${sortBy} ${order}
-      LIMIT $${hasSearch ? 2 : 1} OFFSET $${hasSearch ? 3 : 2}
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
       `,
       dataArgs
     );

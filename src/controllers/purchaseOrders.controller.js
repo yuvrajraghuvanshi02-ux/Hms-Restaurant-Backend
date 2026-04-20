@@ -42,7 +42,7 @@ const createPurchaseOrderFromPr = async (req, res) => {
     const created = await withTenantTx(req.tenantDB, async (client) => {
       const pr = await client.query(
         `
-        SELECT id, supplier_id, request_number, status, remarks
+        SELECT id, supplier_id, request_number, status, remarks, is_po_created
         FROM purchase_requests
         WHERE id = $1
         LIMIT 1
@@ -58,6 +58,11 @@ const createPurchaseOrderFromPr = async (req, res) => {
       if (pr.rows[0].status !== "approved") {
         const err = new Error("PO can only be created from an approved purchase request.");
         err.statusCode = 400;
+        throw err;
+      }
+      if (pr.rows[0].is_po_created) {
+        const err = new Error("PO is already created for this purchase request.");
+        err.statusCode = 409;
         throw err;
       }
 
@@ -110,6 +115,16 @@ const createPurchaseOrderFromPr = async (req, res) => {
           [randomUUID(), poId, it.raw_material_id, it.quantity, it.unit_id]
         );
       }
+
+      await client.query(
+        `
+        UPDATE purchase_requests
+        SET is_po_created = true,
+            updated_at = NOW()
+        WHERE id = $1
+        `,
+        [prId]
+      );
 
       return inserted.rows[0];
     });
