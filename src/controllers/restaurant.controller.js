@@ -2,10 +2,13 @@ const bcrypt = require("bcrypt");
 const fs = require("fs/promises");
 const path = require("path");
 const { randomUUID } = require("crypto");
-const { pool } = require("../config/db");
+const { Op } = require("sequelize");
+const { masterSequelize, Restaurant, RestaurantAdmin } = require("../orm/master");
 const { getTenantPool } = require("../utils/tenantDbManager");
 const { createTenantDatabase } = require("../utils/createTenantDatabase");
-const { runTenantMigrations } = require("../migrations/tenant/runTenantMigrations");
+const { runTenantMigrations } = require("../sequelize/runTenantMigrations");
+const { getTenantSequelize } = require("../orm/tenant");
+const { logError } = require("../utils/logError");
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
@@ -77,11 +80,11 @@ const createRestaurant = async (req, res) => {
   let logoUrl = null;
 
   try {
-    const existingAdmin = await pool.query(
-      "SELECT id FROM restaurant_admins WHERE email = $1 LIMIT 1",
-      [normalizedEmail]
-    );
-    if (existingAdmin.rowCount > 0) {
+    const existingAdmin = await RestaurantAdmin.findOne({
+      where: { email: { [Op.iLike]: normalizedEmail } },
+      attributes: ["id"],
+    });
+    if (existingAdmin) {
       return res.status(409).json({ message: "Admin email already exists." });
     }
 
@@ -99,63 +102,46 @@ const createRestaurant = async (req, res) => {
     await createTenantDatabase(dbName);
     await runTenantMigrations(dbConfig);
 
-    const tenantPool = getTenantPool(dbConfig);
-    await tenantPool.query(
-      `
-      INSERT INTO users (id, first_name, last_name, email, password, role)
-      VALUES ($1, $2, $3, $4, $5, 'admin')
-      `,
-      [adminId, adminFirstName.trim(), adminLastName.trim(), normalizedEmail, hashedPassword]
-    );
+    const tenant = getTenantSequelize(dbConfig);
+    await tenant.models.TenantUser.create({
+      id: adminId,
+      first_name: adminFirstName.trim(),
+      last_name: adminLastName.trim(),
+      email: normalizedEmail,
+      password: hashedPassword,
+      role: "admin",
+    });
 
-    const masterClient = await pool.connect();
-    try {
-      await masterClient.query("BEGIN");
-      await masterClient.query(
-        `
-        INSERT INTO restaurants
-          (id, name, address, logo_url, db_name, db_user, db_password, db_host, db_port)
-        VALUES
-          ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        `,
-        [
-          restaurantId,
-          name.trim(),
-          address?.trim() || null,
-          logoUrl,
-          dbName,
-          dbConfig.user,
-          dbConfig.password,
-          dbConfig.host,
-          dbConfig.port,
-        ]
+    await masterSequelize.transaction(async (t) => {
+      await Restaurant.create(
+        {
+          id: restaurantId,
+          name: name.trim(),
+          address: address?.trim() || null,
+          logo_url: logoUrl,
+          db_name: dbName,
+          db_user: dbConfig.user,
+          db_password: dbConfig.password,
+          db_host: dbConfig.host,
+          db_port: dbConfig.port,
+        },
+        { transaction: t }
       );
 
-      await masterClient.query(
-        `
-        INSERT INTO restaurant_admins
-          (id, restaurant_id, first_name, last_name, email, phone, password, role)
-        VALUES
-          ($1, $2, $3, $4, $5, $6, $7, 'admin')
-        `,
-        [
-          adminId,
-          restaurantId,
-          adminFirstName.trim(),
-          adminLastName.trim(),
-          normalizedEmail,
-          adminPhone.trim(),
-          hashedPassword,
-        ]
+      await RestaurantAdmin.create(
+        {
+          id: adminId,
+          restaurant_id: restaurantId,
+          first_name: adminFirstName.trim(),
+          last_name: adminLastName.trim(),
+          email: normalizedEmail,
+          phone: adminPhone.trim(),
+          password: hashedPassword,
+          role: "admin",
+        },
+        { transaction: t }
       );
-
-      await masterClient.query("COMMIT");
-    } catch (masterError) {
-      await masterClient.query("ROLLBACK");
-      throw masterError;
-    } finally {
-      masterClient.release();
-    }
+    });
 
     return res.status(201).json({
       message: "Restaurant and tenant admin created successfully.",
@@ -169,7 +155,7 @@ const createRestaurant = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Create restaurant failed:", error.message);
+    logError("POST /api/restaurants/create", error);
     return res.status(500).json({
       message: "Failed to create restaurant tenant.",
       error: error.message,
@@ -186,57 +172,56 @@ module.exports = {
     const search = String(req.query.search || "").trim();
     const status = String(req.query.status || "").trim();
 
-    const where = [];
-    const params = [];
-
+    const where = {};
+    const adminWhere = {};
+    if (status) where.status = status;
     if (search) {
-      params.push(`%${search}%`);
-      where.push(`(r.name ILIKE $${params.length} OR a.email ILIKE $${params.length})`);
+      where.name = { [Op.iLike]: `%${search}%` };
+      adminWhere.email = { [Op.iLike]: `%${search}%` };
     }
 
-    if (status) {
-      params.push(status);
-      where.push(`r.status = $${params.length}`);
-    }
+    const { rows, count } = await Restaurant.findAndCountAll({
+      where:
+        search
+          ? {
+              [Op.or]: [{ name: { [Op.iLike]: `%${search}%` } }],
+              ...(status ? { status } : {}),
+            }
+          : where,
+      include: [
+        {
+          model: RestaurantAdmin,
+          as: "admin",
+          required: true,
+          where: search ? { [Op.or]: [adminWhere, {}] } : undefined,
+        },
+      ],
+      order: [["created_at", "DESC"]],
+      offset,
+      limit,
+    });
 
-    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
-
-    const countQuery = `
-      SELECT COUNT(*)::int AS total
-      FROM restaurants r
-      JOIN restaurant_admins a ON r.id = a.restaurant_id
-      ${whereSql}
-    `;
-
-    const listQuery = `
-      SELECT
-        r.id,
-        r.name,
-        r.address,
-        r.logo_url,
-        r.status,
-        r.created_at,
-        a.id AS admin_id,
-        a.first_name AS admin_first_name,
-        a.last_name AS admin_last_name,
-        a.email AS admin_email,
-        a.phone AS admin_phone
-      FROM restaurants r
-      JOIN restaurant_admins a ON r.id = a.restaurant_id
-      ${whereSql}
-      ORDER BY r.created_at DESC
-      OFFSET $${params.length + 1}
-      LIMIT $${params.length + 2}
-    `;
-
-    const countResult = await pool.query(countQuery, params);
-    const total = countResult.rows[0]?.total || 0;
+    const total = count;
     const totalPages = Math.max(1, Math.ceil(total / limit));
 
-    const listResult = await pool.query(listQuery, [...params, offset, limit]);
-
     return res.status(200).json({
-      data: listResult.rows,
+      data: rows.map((r) => {
+        const json = r.toJSON();
+        return {
+          id: json.id,
+          name: json.name,
+          address: json.address,
+          logo_url: json.logo_url,
+          db_name: json.db_name,
+          status: json.status,
+          created_at: json.created_at,
+          admin_id: json.admin?.id,
+          admin_first_name: json.admin?.first_name,
+          admin_last_name: json.admin?.last_name,
+          admin_email: json.admin?.email,
+          admin_phone: json.admin?.phone,
+        };
+      }),
       pagination: {
         total,
         page,
@@ -248,35 +233,33 @@ module.exports = {
 
   getRestaurantById: async (req, res) => {
     const { id } = req.params;
-    const result = await pool.query(
-      `
-      SELECT
-        r.id,
-        r.name,
-        r.address,
-        r.logo_url,
-        r.status,
-        r.created_at,
-        a.id AS admin_id,
-        a.first_name AS admin_first_name,
-        a.last_name AS admin_last_name,
-        a.email AS admin_email,
-        a.phone AS admin_phone,
-        a.role AS admin_role,
-        a.created_at AS admin_created_at
-      FROM restaurants r
-      JOIN restaurant_admins a ON r.id = a.restaurant_id
-      WHERE r.id = $1
-      LIMIT 1
-      `,
-      [id]
-    );
+    const restaurant = await Restaurant.findByPk(id, {
+      include: [{ model: RestaurantAdmin, as: "admin", required: true }],
+    });
 
-    if (result.rowCount === 0) {
+    if (!restaurant) {
       return res.status(404).json({ message: "Restaurant not found." });
     }
 
-    return res.status(200).json({ data: result.rows[0] });
+    const json = restaurant.toJSON();
+    return res.status(200).json({
+      data: {
+        id: json.id,
+        name: json.name,
+        address: json.address,
+        logo_url: json.logo_url,
+        db_name: json.db_name,
+        status: json.status,
+        created_at: json.created_at,
+        admin_id: json.admin?.id,
+        admin_first_name: json.admin?.first_name,
+        admin_last_name: json.admin?.last_name,
+        admin_email: json.admin?.email,
+        admin_phone: json.admin?.phone,
+        admin_role: json.admin?.role,
+        admin_created_at: json.admin?.created_at,
+      },
+    });
   },
 
   updateRestaurant: async (req, res) => {
@@ -307,126 +290,69 @@ module.exports = {
       return res.status(400).json({ message: "Validation failed.", errors });
     }
 
-    const current = await pool.query(
-      `
-      SELECT r.id, a.id AS admin_id
-      FROM restaurants r
-      JOIN restaurant_admins a ON r.id = a.restaurant_id
-      WHERE r.id = $1
-      LIMIT 1
-      `,
-      [id]
-    );
-    if (current.rowCount === 0) {
+    const restaurant = await Restaurant.findByPk(id, {
+      include: [{ model: RestaurantAdmin, as: "admin", required: true }],
+    });
+    if (!restaurant) {
       return res.status(404).json({ message: "Restaurant not found." });
     }
-    const adminId = current.rows[0].admin_id;
+    const adminId = restaurant.admin.id;
 
     const normalizedEmail = admin_email ? String(admin_email).trim().toLowerCase() : null;
     if (normalizedEmail) {
-      const conflict = await pool.query(
-        "SELECT id FROM restaurant_admins WHERE email = $1 AND id <> $2 LIMIT 1",
-        [normalizedEmail, adminId]
-      );
-      if (conflict.rowCount > 0) {
+      const conflict = await RestaurantAdmin.findOne({
+        where: {
+          email: { [Op.iLike]: normalizedEmail },
+          id: { [Op.ne]: adminId },
+        },
+        attributes: ["id"],
+      });
+      if (conflict) {
         return res.status(409).json({ message: "Admin email already exists." });
       }
     }
 
-    const restaurantFields = [];
-    const restaurantValues = [];
-    if (name !== undefined) {
-      restaurantValues.push(String(name).trim());
-      restaurantFields.push(`name = $${restaurantValues.length}`);
-    }
-    if (address !== undefined) {
-      restaurantValues.push(String(address).trim() || null);
-      restaurantFields.push(`address = $${restaurantValues.length}`);
-    }
-    if (logo_url !== undefined) {
-      restaurantValues.push(String(logo_url).trim() || null);
-      restaurantFields.push(`logo_url = $${restaurantValues.length}`);
-    }
-
-    const adminFields = [];
-    const adminValues = [];
-    if (admin_first_name !== undefined) {
-      adminValues.push(String(admin_first_name).trim());
-      adminFields.push(`first_name = $${adminValues.length}`);
-    }
-    if (admin_last_name !== undefined) {
-      adminValues.push(String(admin_last_name).trim());
-      adminFields.push(`last_name = $${adminValues.length}`);
-    }
-    if (admin_phone !== undefined) {
-      adminValues.push(String(admin_phone).trim());
-      adminFields.push(`phone = $${adminValues.length}`);
-    }
-    if (normalizedEmail !== null) {
-      adminValues.push(normalizedEmail);
-      adminFields.push(`email = $${adminValues.length}`);
-    }
-    if (admin_password) {
-      const hashed = await bcrypt.hash(String(admin_password), 10);
-      adminValues.push(hashed);
-      adminFields.push(`password = $${adminValues.length}`);
-    }
-
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      if (restaurantFields.length) {
-        await client.query(
-          `UPDATE restaurants SET ${restaurantFields.join(", ")} WHERE id = $${
-            restaurantValues.length + 1
-          }`,
-          [...restaurantValues, id]
-        );
+    await masterSequelize.transaction(async (t) => {
+      const restaurantUpdates = {};
+      if (name !== undefined) restaurantUpdates.name = String(name).trim();
+      if (address !== undefined) restaurantUpdates.address = String(address).trim() || null;
+      if (logo_url !== undefined) restaurantUpdates.logo_url = String(logo_url).trim() || null;
+      if (Object.keys(restaurantUpdates).length) {
+        await restaurant.update(restaurantUpdates, { transaction: t });
       }
 
-      if (adminFields.length) {
-        await client.query(
-          `UPDATE restaurant_admins SET ${adminFields.join(", ")} WHERE id = $${
-            adminValues.length + 1
-          }`,
-          [...adminValues, adminId]
-        );
+      const adminUpdates = {};
+      if (admin_first_name !== undefined)
+        adminUpdates.first_name = String(admin_first_name).trim();
+      if (admin_last_name !== undefined) adminUpdates.last_name = String(admin_last_name).trim();
+      if (admin_phone !== undefined) adminUpdates.phone = String(admin_phone).trim();
+      if (normalizedEmail !== null) adminUpdates.email = normalizedEmail;
+      if (admin_password) adminUpdates.password = await bcrypt.hash(String(admin_password), 10);
+      if (Object.keys(adminUpdates).length) {
+        await restaurant.admin.update(adminUpdates, { transaction: t });
       }
+    });
 
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
-    }
-
-    const updated = await pool.query(
-      `
-      SELECT
-        r.id,
-        r.name,
-        r.address,
-        r.logo_url,
-        r.status,
-        r.created_at,
-        a.id AS admin_id,
-        a.first_name AS admin_first_name,
-        a.last_name AS admin_last_name,
-        a.email AS admin_email,
-        a.phone AS admin_phone
-      FROM restaurants r
-      JOIN restaurant_admins a ON r.id = a.restaurant_id
-      WHERE r.id = $1
-      LIMIT 1
-      `,
-      [id]
-    );
+    const updatedRestaurant = await Restaurant.findByPk(id, {
+      include: [{ model: RestaurantAdmin, as: "admin", required: true }],
+    });
 
     return res.status(200).json({
       message: "Restaurant updated successfully.",
-      data: updated.rows[0],
+      data: {
+        id: updatedRestaurant.id,
+        name: updatedRestaurant.name,
+        address: updatedRestaurant.address,
+        logo_url: updatedRestaurant.logo_url,
+        db_name: updatedRestaurant.db_name,
+        status: updatedRestaurant.status,
+        created_at: updatedRestaurant.created_at,
+        admin_id: updatedRestaurant.admin.id,
+        admin_first_name: updatedRestaurant.admin.first_name,
+        admin_last_name: updatedRestaurant.admin.last_name,
+        admin_email: updatedRestaurant.admin.email,
+        admin_phone: updatedRestaurant.admin.phone,
+      },
     });
   },
 };

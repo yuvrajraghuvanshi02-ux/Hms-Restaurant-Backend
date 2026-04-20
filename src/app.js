@@ -3,6 +3,15 @@ const cors = require("cors");
 const path = require("path");
 const authRoutes = require("./routes/auth.routes");
 const restaurantRoutes = require("./routes/restaurant.routes");
+const inventoryRoutes = require("./routes/inventory.routes");
+const mastersRoutes = require("./routes/masters.routes");
+const menuRoutes = require("./routes/menu.routes");
+const uploadsRoutes = require("./routes/uploads.routes");
+const recipesRoutes = require("./routes/recipes.routes");
+const stockRoutes = require("./routes/stock.routes");
+const suppliersRoutes = require("./routes/suppliers.routes");
+const purchaseRequestsRoutes = require("./routes/purchaseRequests.routes");
+const purchaseOrdersRoutes = require("./routes/purchaseOrders.routes");
 const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
@@ -20,6 +29,15 @@ app.get("/api/health", (req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use("/api/restaurants", restaurantRoutes);
+app.use("/api/inventory", inventoryRoutes);
+app.use("/api/masters", mastersRoutes);
+app.use("/api/menu", menuRoutes);
+app.use("/api/uploads", uploadsRoutes);
+app.use("/api/recipes", recipesRoutes);
+app.use("/api/stock", stockRoutes);
+app.use("/api/suppliers", suppliersRoutes);
+app.use("/api/purchase-requests", purchaseRequestsRoutes);
+app.use("/api/purchase-orders", purchaseOrdersRoutes);
 app.use(errorHandler);
 
 module.exports = app;

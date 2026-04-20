@@ -1,6 +1,8 @@
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const { pool } = require("../config/db");
+const { Op } = require("sequelize");
+const { RestaurantAdmin, SuperAdminUser } = require("../orm/master");
+const { logError } = require("../utils/logError");
 
 const normalizeEmail = (email) => String(email || "").trim().toLowerCase();
 
@@ -21,19 +23,14 @@ const login = async (req, res) => {
     }
 
     if (role === "super_admin") {
-      const query = `
-        SELECT id, email, password, role, status
-        FROM super_admin_users
-        WHERE email = $1
-        LIMIT 1
-      `;
-      const result = await pool.query(query, [emailNormalized]);
+      const user = await SuperAdminUser.findOne({
+        where: { email: { [Op.iLike]: emailNormalized } },
+      });
 
-      if (result.rowCount === 0) {
+      if (!user) {
         return res.status(401).json({ message: "Invalid credentials." });
       }
 
-      const user = result.rows[0];
       if (user.status !== "active") {
         return res.status(403).json({ message: "User is inactive." });
       }
@@ -64,19 +61,14 @@ const login = async (req, res) => {
     }
 
     if (role === "admin") {
-      const query = `
-        SELECT id, restaurant_id, email, password, role
-        FROM restaurant_admins
-        WHERE email = $1
-        LIMIT 1
-      `;
-      const result = await pool.query(query, [emailNormalized]);
+      const user = await RestaurantAdmin.findOne({
+        where: { email: { [Op.iLike]: emailNormalized } },
+      });
 
-      if (result.rowCount === 0) {
+      if (!user) {
         return res.status(401).json({ message: "Invalid credentials." });
       }
 
-      const user = result.rows[0];
       const isPasswordValid = await bcrypt.compare(password, user.password);
       if (!isPasswordValid) {
         return res.status(401).json({ message: "Invalid credentials." });
@@ -106,7 +98,7 @@ const login = async (req, res) => {
 
     return res.status(400).json({ message: "Invalid role." });
   } catch (error) {
-    console.error("Login error:", error.message);
+    logError("POST /api/auth/login", error);
     return res.status(500).json({ message: "Internal server error." });
   }
 };

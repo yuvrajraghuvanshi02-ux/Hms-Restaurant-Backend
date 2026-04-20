@@ -1,4 +1,5 @@
-const { pool } = require("../config/db");
+const { Restaurant } = require("../orm/master");
+const { getTenantSequelize } = require("../orm/tenant");
 const { getTenantPool } = require("../utils/tenantDbManager");
 
 const attachTenantDb = async (req, res, next) => {
@@ -15,21 +16,11 @@ const attachTenantDb = async (req, res, next) => {
         return res.status(400).json({ message: "restaurant_id missing in token." });
       }
 
-      const restaurantResult = await pool.query(
-        `
-        SELECT id, name, db_name, db_user, db_password, db_host, db_port
-        FROM restaurants
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [restaurantId]
-      );
-
-      if (restaurantResult.rowCount === 0) {
+      const restaurant = await Restaurant.findByPk(restaurantId);
+      if (!restaurant) {
         return res.status(404).json({ message: "Restaurant not found." });
       }
 
-      const restaurant = restaurantResult.rows[0];
       const dbConfig = {
         host: restaurant.db_host,
         port: Number(restaurant.db_port),
@@ -38,7 +29,10 @@ const attachTenantDb = async (req, res, next) => {
         password: restaurant.db_password,
       };
 
-      req.restaurant = restaurant;
+      req.restaurant = restaurant.toJSON();
+      const tenant = getTenantSequelize(dbConfig);
+      req.tenant = tenant;
+      // For modules that explicitly require pg-style querying:
       req.tenantDB = getTenantPool(dbConfig);
       return next();
     }

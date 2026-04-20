@@ -1,0 +1,26 @@
+{
+  "development": {
+    "username": "postgres",
+    "password": "root",
+    "database": "cypher_restaurant_master",
+    "host": "localhost",
+    "port": "5432",
+    "dialect": "postgres"
+  },
+  "rms_restaurant_1776275188990_4893bf41": {
+    "username": "postgres",
+    "password": "Bite@123",
+    "database": "rms_restaurant_1776275188990_4893bf41",
+    "host": "localhost",
+    "port": "5432",
+    "dialect": "postgres"
+  },
+  "production": {
+    "username": "${DB_USER}",
+    "password": "${DB_PASSWORD}",
+    "database": "${DB_NAME}",
+    "host": "${DB_HOST}",
+    "port": "${DB_PORT}",
+    "dialect": "postgres"
+  }
+}
