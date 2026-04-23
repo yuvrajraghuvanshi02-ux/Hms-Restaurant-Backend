@@ -12,6 +12,12 @@ const stockRoutes = require("./routes/stock.routes");
 const suppliersRoutes = require("./routes/suppliers.routes");
 const purchaseRequestsRoutes = require("./routes/purchaseRequests.routes");
 const purchaseOrdersRoutes = require("./routes/purchaseOrders.routes");
+const grnsRoutes = require("./routes/grns.routes");
+const tableTypesRoutes = require("./routes/tableTypes.routes");
+const tablesRoutes = require("./routes/tables.routes");
+const ordersRoutes = require("./routes/orders.routes");
+const kitchenRoutes = require("./routes/kitchen.routes");
+const paymentsRoutes = require("./routes/payments.routes");
 const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
@@ -38,6 +44,12 @@ app.use("/api/stock", stockRoutes);
 app.use("/api/suppliers", suppliersRoutes);
 app.use("/api/purchase-requests", purchaseRequestsRoutes);
 app.use("/api/purchase-orders", purchaseOrdersRoutes);
+app.use("/api/grns", grnsRoutes);
+app.use("/api/table-types", tableTypesRoutes);
+app.use("/api/tables", tablesRoutes);
+app.use("/api/orders", ordersRoutes);
+app.use("/api/kitchen", kitchenRoutes);
+app.use("/api/payments", paymentsRoutes);
 app.use(errorHandler);
 
 module.exports = app;
