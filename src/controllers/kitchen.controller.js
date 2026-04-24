@@ -11,13 +11,15 @@ const listKitchenOrders = async (req, res) => {
         o.order_number,
         o.status,
         o.kot_sent_at,
+        o.served_at,
+        o.completed_at,
         o.payment_status,
         o.created_at,
         t.name AS table_name
       FROM orders o
       LEFT JOIN tables t ON t.id = o.table_id
       WHERE o.status = ANY($1::text[])
-      ORDER BY o.created_at ASC
+      ORDER BY o.kot_sent_at ASC NULLS LAST, o.created_at ASC
       `,
       [kitchenStatuses]
     );
@@ -124,6 +126,8 @@ const listKitchenOrders = async (req, res) => {
         status: o.status,
         table_name: o.table_name,
         kot_sent_at: o.kot_sent_at,
+        served_at: o.served_at,
+        completed_at: o.completed_at,
         payment_status: o.payment_status,
         created_at: o.created_at,
         items: itemsByOrder.get(o.order_id) || [],

@@ -172,14 +172,16 @@ const createOrder = async (req, res) => {
         INSERT INTO orders (
           id, order_number, order_type, status, table_id,
           guest_name, guest_phone, guest_address,
-          tax_percentage, tax_amount, total_amount
+          tax_percentage, tax_amount, total_amount,
+          kot_sent_at
         )
-        VALUES ($1, $2, $3, 'created', $4, $5, $6, $7, $8, $9, $10)
+        VALUES ($1, $2, $3, 'kot_sent', $4, $5, $6, $7, $8, $9, $10, NOW())
         RETURNING
           id, order_number, order_type, status, table_id,
           guest_name, guest_phone, guest_address,
           tax_percentage, tax_amount,
           total_amount, total_cost, total_profit,
+          kot_sent_at,
           created_at, updated_at
         `,
         [
@@ -415,6 +417,10 @@ const listOrders = async (req, res) => {
         o.order_type,
         o.status,
         o.kot_sent_at,
+        o.served_at,
+        o.completed_at,
+        o.discount_amount,
+        o.tip_amount,
         o.payment_status,
         o.guest_name,
         o.guest_phone,
@@ -449,6 +455,116 @@ const listOrders = async (req, res) => {
   }
 };
 
+const listLiveOrders = async (req, res) => {
+  try {
+    const typeFilter = String(req.query?.type || "all").trim().toLowerCase();
+    const allowedTypes = new Set(["all", "dine_in", "delivery", "takeaway"]);
+    const type = allowedTypes.has(typeFilter) ? typeFilter : "all";
+
+    const params = parseListParams(req.query, { defaultSortBy: "created_at", defaultOrder: "DESC" });
+
+    // Live orders should never include completed orders
+    const statuses = ["kot_sent", "preparing", "ready", "served"];
+    const whereParts = ["o.status = ANY($1::text[])"];
+    const args = [statuses];
+    if (type !== "all") {
+      args.push(type);
+      whereParts.push(`o.order_type = $${args.length}`);
+    }
+    const where = `WHERE ${whereParts.join(" AND ")}`;
+
+    const totalResult = await req.tenantDB.query(
+      `
+      SELECT COUNT(*)::int AS total
+      FROM orders o
+      LEFT JOIN tables t ON t.id = o.table_id
+      ${where}
+      `,
+      args
+    );
+    const total = totalResult.rows[0]?.total ?? 0;
+
+    const dataArgs = [...args, params.limit, params.offset];
+    const limitIdx = dataArgs.length - 1;
+    const offsetIdx = dataArgs.length;
+
+    const ordersQ = await req.tenantDB.query(
+      `
+      SELECT
+        o.id AS order_id,
+        o.order_number,
+        o.order_type,
+        o.status,
+        o.kot_sent_at,
+        o.created_at,
+        o.completed_at,
+        o.discount_amount,
+        o.tip_amount,
+        t.name AS table_name
+      FROM orders o
+      LEFT JOIN tables t ON t.id = o.table_id
+      ${where}
+      ORDER BY o.created_at DESC
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
+      `,
+      dataArgs
+    );
+
+    const orders = ordersQ.rows || [];
+    if (orders.length === 0)
+      return res.status(200).json({ data: [], pagination: buildPagination({ total, page: params.page, limit: params.limit }) });
+
+    const orderIds = orders.map((o) => o.order_id);
+
+    const itemsQ = await req.tenantDB.query(
+      `
+      SELECT
+        oi.order_id,
+        i.name AS item_name,
+        v.name AS variant_name,
+        oi.quantity
+      FROM order_items oi
+      JOIN menu_item_variants v ON v.id = oi.variant_id
+      JOIN menu_items i ON i.id = v.item_id
+      WHERE oi.order_id = ANY($1::uuid[])
+      ORDER BY oi.order_id ASC, i.name ASC, v.name ASC
+      `,
+      [orderIds]
+    );
+
+    const itemsByOrder = new Map();
+    for (const it of itemsQ.rows || []) {
+      const arr = itemsByOrder.get(it.order_id) || [];
+      arr.push({
+        item_name: it.item_name,
+        variant_name: it.variant_name,
+        quantity: it.quantity,
+      });
+      itemsByOrder.set(it.order_id, arr);
+    }
+
+    return res.status(200).json({
+      data: orders.map((o) => ({
+        order_id: o.order_id,
+        order_number: o.order_number,
+        order_type: o.order_type,
+        status: o.status,
+        kot_sent_at: o.kot_sent_at,
+        created_at: o.created_at,
+        completed_at: o.completed_at,
+        discount_amount: o.discount_amount,
+        tip_amount: o.tip_amount,
+        table_name: o.table_name,
+        items: itemsByOrder.get(o.order_id) || [],
+      })),
+      pagination: buildPagination({ total, page: params.page, limit: params.limit }),
+    });
+  } catch (error) {
+    logError("GET /api/orders/live", error);
+    return res.status(500).json({ message: "Failed to fetch live orders." });
+  }
+};
+
 const getOrder = async (req, res) => {
   const { id } = req.params;
   try {
@@ -460,6 +576,10 @@ const getOrder = async (req, res) => {
         o.order_type,
         o.status,
         o.kot_sent_at,
+        o.served_at,
+        o.completed_at,
+        o.discount_amount,
+        o.tip_amount,
         o.payment_status,
         o.guest_name,
         o.guest_phone,
@@ -529,12 +649,18 @@ const getActiveOrderByTable = async (req, res) => {
         o.id AS order_id,
         o.table_id,
         o.status,
+        o.kot_sent_at,
+        o.served_at,
+        o.completed_at,
+        o.created_at,
         o.payment_status,
         o.guest_name,
         o.guest_phone,
         o.guest_address,
         o.tax_percentage,
         o.tax_amount,
+        o.discount_amount,
+        o.tip_amount,
         o.total_amount
       FROM orders o
       WHERE o.table_id = $1
@@ -595,7 +721,7 @@ const updateOrderStatus = async (req, res) => {
   try {
     const out = await withTenantTx(req.tenantDB, async (client) => {
       const ord = await client.query(
-        "SELECT id, status, kot_sent_at, payment_status FROM orders WHERE id = $1 LIMIT 1 FOR UPDATE",
+        "SELECT id, status, kot_sent_at, served_at, completed_at, payment_status FROM orders WHERE id = $1 LIMIT 1 FOR UPDATE",
         [id]
       );
       if (ord.rowCount === 0) {
@@ -622,28 +748,19 @@ const updateOrderStatus = async (req, res) => {
       if (next !== "served") {
         // created -> kot_sent should set kot_sent_at only once
         const shouldSetKot = current === "created" && next === "kot_sent";
-        const updated = shouldSetKot
-          ? await client.query(
-              `
-              UPDATE orders
-              SET status = $1,
-                  kot_sent_at = COALESCE(kot_sent_at, NOW()),
-                  updated_at = NOW()
-              WHERE id = $2
-              RETURNING id, order_number, status, kot_sent_at, updated_at
-              `,
-              [next, id]
-            )
-          : await client.query(
-              `
-              UPDATE orders
-              SET status = $1,
-                  updated_at = NOW()
-              WHERE id = $2
-              RETURNING id, order_number, status, kot_sent_at, updated_at
-              `,
-              [next, id]
-            );
+        const shouldSetCompleted = current === "served" && next === "completed";
+        const updated = await client.query(
+          `
+          UPDATE orders
+          SET status = $1,
+              kot_sent_at = CASE WHEN $2::boolean THEN COALESCE(kot_sent_at, NOW()) ELSE kot_sent_at END,
+              completed_at = CASE WHEN $3::boolean THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
+              updated_at = NOW()
+          WHERE id = $4
+          RETURNING id, order_number, status, kot_sent_at, served_at, completed_at, updated_at
+          `,
+          [next, shouldSetKot, shouldSetCompleted, id]
+        );
         return updated.rows[0];
       }
 
@@ -756,9 +873,10 @@ const updateOrderStatus = async (req, res) => {
             total_amount = $1,
             total_cost = $2,
             total_profit = $3,
+            served_at = COALESCE(served_at, NOW()),
             updated_at = NOW()
         WHERE id = $4
-        RETURNING id, order_number, status, kot_sent_at, total_amount, total_cost, total_profit, updated_at
+        RETURNING id, order_number, status, kot_sent_at, served_at, completed_at, total_amount, total_cost, total_profit, updated_at
         `,
         [totalAmount, totalCost, totalProfit, id]
       );
@@ -779,6 +897,7 @@ module.exports = {
   createOrder,
   updateOrder,
   listOrders,
+  listLiveOrders,
   getOrder,
   getActiveOrderByTable,
   updateOrderStatus,

@@ -33,12 +33,8 @@ const validateMetadata = (mode, metadata, amount) => {
   if (amount <= 0) return null;
   if (mode === "upi") {
     const tx = String(m?.transaction_id || "").trim();
-    if (!tx) {
-      const err = new Error("UPI transaction_id is required.");
-      err.statusCode = 400;
-      throw err;
-    }
-    return { ...m, transaction_id: tx };
+    // UPI transaction_id is optional; store it if present
+    return tx ? { ...m, transaction_id: tx } : m;
   }
   if (mode === "card") {
     const last4 = String(m?.last_4_digits || "").trim();
@@ -53,7 +49,7 @@ const validateMetadata = (mode, metadata, amount) => {
 };
 
 const createPayment = async (req, res) => {
-  const { order_id, payments } = req.body || {};
+  const { order_id, payments, discount_amount } = req.body || {};
   const orderId = String(order_id || "").trim();
   if (!orderId) return res.status(400).json({ message: "order_id is required." });
   const rows = Array.isArray(payments) ? payments : [];
@@ -82,6 +78,9 @@ const createPayment = async (req, res) => {
 
   try {
     const out = await withTenantTx(req.tenantDB, async (client) => {
+      const hasDiscountInput = discount_amount !== undefined && discount_amount !== null && discount_amount !== "";
+      const discountAmountInput = hasDiscountInput ? toNonNegativeNumber(discount_amount, "discount_amount") : 0;
+
       const ord = await client.query(
         `
         SELECT
@@ -130,11 +129,29 @@ const createPayment = async (req, res) => {
         err.statusCode = 400;
         throw err;
       }
-      if (Math.abs(paidAmount - expectedTotal) > 0.000001) {
-        const err = new Error("Total paid must equal order total_amount.");
+
+      if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
+        const err = new Error("paid_amount must be greater than 0.");
         err.statusCode = 400;
         throw err;
       }
+
+      // Auto derive discount/tip from what customer paid (order total).
+      // - If paid < total => discount = total - paid, tip = 0, final_payable = paid
+      // - If paid > total => tip = paid - total, discount = 0, final_payable = total
+      // - If equal => both 0, final_payable = total
+      //
+      // If discount_amount is explicitly provided, we respect it for final payable calculation
+      // and then compute tip relative to final payable.
+      const discountAmount = hasDiscountInput ? discountAmountInput : Math.max(0, expectedTotal - paidAmount);
+      const finalPayable = expectedTotal - discountAmount;
+      if (!Number.isFinite(finalPayable) || finalPayable < 0) {
+        const err = new Error("discount_amount cannot exceed total_amount.");
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const tipAmount = Math.max(0, paidAmount - finalPayable);
 
       const existing = await client.query("SELECT id FROM payments WHERE order_id = $1 LIMIT 1", [orderId]);
       if (existing.rowCount > 0) {
@@ -150,7 +167,7 @@ const createPayment = async (req, res) => {
         VALUES ($1, $2, $3, $4)
         RETURNING id, order_id, total_amount, paid_amount, created_at, updated_at
         `,
-        [paymentId, orderId, expectedTotal, paidAmount]
+        [paymentId, orderId, finalPayable, paidAmount]
       );
 
       for (const p of normalized) {
@@ -169,10 +186,13 @@ const createPayment = async (req, res) => {
         UPDATE orders
         SET status = 'completed',
             payment_status = 'paid',
+            discount_amount = $1,
+            tip_amount = $2,
+            completed_at = COALESCE(completed_at, NOW()),
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $3
         `,
-        [orderId]
+        [discountAmount, tipAmount, orderId]
       );
 
       return inserted.rows[0];

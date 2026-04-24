@@ -6,6 +6,7 @@ const {
   createOrder,
   updateOrder,
   listOrders,
+  listLiveOrders,
   getOrder,
   getActiveOrderByTable,
   updateOrderStatus,
@@ -17,6 +18,7 @@ router.use(requireAuth, attachTenantDb, requireTenantAdmin);
 
 router.post("/", createOrder);
 router.get("/", listOrders);
+router.get("/live", listLiveOrders);
 router.get("/by-table/:table_id", getActiveOrderByTable);
 router.get("/:id", getOrder);
 router.put("/:id", updateOrder);
