@@ -42,7 +42,8 @@ const createPurchaseOrderFromPr = async (req, res) => {
     const created = await withTenantTx(req.tenantDB, async (client) => {
       const pr = await client.query(
         `
-        SELECT id, supplier_id, request_number, status, remarks, is_po_created
+        SELECT id, supplier_id, request_number, status, remarks, is_po_created,
+               purchase_total, gst_percentage, gst_amount, selected_tax_ids
         FROM purchase_requests
         WHERE id = $1
         LIMIT 1
@@ -96,12 +97,24 @@ const createPurchaseOrderFromPr = async (req, res) => {
       const inserted = await client.query(
         `
         INSERT INTO purchase_orders (
-          id, purchase_request_id, supplier_id, po_number, status, remarks
+          id, purchase_request_id, supplier_id, po_number, status, remarks,
+          purchase_total, gst_percentage, gst_amount, selected_tax_ids
         )
-        VALUES ($1, $2, $3, $4, 'created', $5)
-        RETURNING id, purchase_request_id, supplier_id, po_number, status, remarks, created_at, updated_at
+        VALUES ($1, $2, $3, $4, 'created', $5, $6, $7, $8, $9::jsonb)
+        RETURNING id, purchase_request_id, supplier_id, po_number, status, remarks,
+                  purchase_total, gst_percentage, gst_amount, selected_tax_ids, created_at, updated_at
         `,
-        [poId, prId, pr.rows[0].supplier_id, poNumber, pr.rows[0].remarks || null]
+        [
+          poId,
+          prId,
+          pr.rows[0].supplier_id,
+          poNumber,
+          pr.rows[0].remarks || null,
+          Number(pr.rows[0].purchase_total || 0),
+          Number(pr.rows[0].gst_percentage || 0),
+          Number(pr.rows[0].gst_amount || 0),
+          JSON.stringify(Array.isArray(pr.rows[0].selected_tax_ids) ? pr.rows[0].selected_tax_ids : []),
+        ]
       );
 
       for (const it of items.rows) {
@@ -124,6 +137,17 @@ const createPurchaseOrderFromPr = async (req, res) => {
         WHERE id = $1
         `,
         [prId]
+      );
+
+      const inputGstAmount = Number(pr.rows[0].gst_amount || 0);
+      await client.query(
+        `
+        INSERT INTO gst_ledger (id, type, source, source_id, amount)
+        VALUES ($1, 'input', 'purchase', $2, $3)
+        ON CONFLICT (type, source, source_id)
+        DO UPDATE SET amount = EXCLUDED.amount, updated_at = NOW()
+        `,
+        [randomUUID(), poId, inputGstAmount]
       );
 
       return inserted.rows[0];
@@ -171,6 +195,10 @@ const listPurchaseOrders = async (req, res) => {
         po.id,
         po.po_number,
         po.status,
+        po.purchase_total,
+        po.gst_percentage,
+        po.gst_amount,
+        po.selected_tax_ids,
         po.created_at,
         po.updated_at,
         po.supplier_id,
@@ -207,6 +235,10 @@ const getPurchaseOrder = async (req, res) => {
         po.po_number,
         po.status,
         po.remarks,
+        po.purchase_total,
+        po.gst_percentage,
+        po.gst_amount,
+        po.selected_tax_ids,
         po.created_at,
         po.updated_at
       FROM purchase_orders po

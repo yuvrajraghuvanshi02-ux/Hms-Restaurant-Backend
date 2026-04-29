@@ -1,7 +1,7 @@
 const { randomUUID } = require("crypto");
 const { logError } = require("../utils/logError");
 const { parseListParams, buildPagination, pickSort } = require("../utils/listQuery");
-const { deductStockByVariantWithClient } = require("../services/stock.service");
+const { deductStockByVariantWithClient, addStockWithClient } = require("../services/stock.service");
 
 const isUniqueViolation = (error) => error?.code === "23505";
 
@@ -109,8 +109,140 @@ const computeTax = (subtotal, taxPercentage) => {
   return { taxAmount, total };
 };
 
+const normalizeTaxIds = (value) => {
+  const arr = Array.isArray(value) ? value : [];
+  return Array.from(
+    new Set(
+      arr
+        .map((x) => String(x || "").trim())
+        .filter(Boolean)
+    )
+  );
+};
+
+const computeTaxesFromSelection = async (client, subtotal, selectedTaxIds) => {
+  const sub = Number(subtotal || 0);
+  const ids = normalizeTaxIds(selectedTaxIds);
+  if (ids.length === 0) return { selectedTaxIds: [], taxBreakup: {}, totalTaxAmount: 0, taxPercentage: 0 };
+
+  const q = await client.query(
+    `
+    SELECT id, name, percentage
+    FROM taxes
+    WHERE id = ANY($1::uuid[])
+      AND is_active = TRUE
+    `,
+    [ids]
+  );
+  const rows = q.rows || [];
+  const selected = rows.map((r) => String(r.id));
+  const taxBreakup = {};
+  let totalTaxAmount = 0;
+  let taxPercentage = 0;
+  for (const t of rows) {
+    const pct = Number(t.percentage || 0);
+    const amount = (sub * pct) / 100;
+    taxBreakup[String(t.name || "").trim() || "Tax"] = amount;
+    totalTaxAmount += amount;
+    taxPercentage += pct;
+  }
+  return { selectedTaxIds: selected, taxBreakup, totalTaxAmount, taxPercentage };
+};
+
+const recalcOrderTotalsForNonVoidedItems = async (client, orderId, { taxPercentage, selectedTaxIds, totalCost, discountAmount }) => {
+  const sums = await client.query(
+    `
+    SELECT COALESCE(SUM(total_price), 0)::numeric AS subtotal
+    FROM order_items
+    WHERE order_id = $1
+      AND COALESCE(status, 'active') IN ('active', 'replaced')
+      AND COALESCE(is_voided, FALSE) = FALSE
+    `,
+    [orderId]
+  );
+  const subtotal = Number(sums.rows[0]?.subtotal || 0);
+  let taxAmount = 0;
+  let total = subtotal;
+  let outTaxPercentage = Number(taxPercentage || 0);
+  let outSelectedTaxIds = normalizeTaxIds(selectedTaxIds);
+  let outTaxBreakup = {};
+  let outTotalTaxAmount = 0;
+  if (outSelectedTaxIds.length > 0) {
+    const tx = await computeTaxesFromSelection(client, subtotal, outSelectedTaxIds);
+    outSelectedTaxIds = tx.selectedTaxIds;
+    outTaxBreakup = tx.taxBreakup;
+    outTotalTaxAmount = Number(tx.totalTaxAmount || 0);
+    outTaxPercentage = Number(tx.taxPercentage || 0);
+    taxAmount = outTotalTaxAmount;
+    total = subtotal + taxAmount;
+  } else {
+    const c = computeTax(subtotal, outTaxPercentage);
+    taxAmount = Number(c.taxAmount || 0);
+    total = Number(c.total || 0);
+    outTaxBreakup = outTaxPercentage > 0 ? { Tax: taxAmount } : {};
+    outTotalTaxAmount = taxAmount;
+  }
+  const netRevenue = total - Math.max(0, Number(discountAmount || 0));
+  const totalProfit = netRevenue - Number(totalCost || 0);
+  return {
+    subtotal,
+    taxAmount,
+    total,
+    totalProfit,
+    selectedTaxIds: outSelectedTaxIds,
+    taxBreakup: outTaxBreakup,
+    totalTaxAmount: outTotalTaxAmount,
+    taxPercentage: outTaxPercentage,
+  };
+};
+
+const toConsumptionQty = ({ recipeQty, recipeUnitId, qtyMultiplier, consumptionUnitId, purchaseUnitId, conversionFactor, rawMaterialName }) => {
+  const perUnit = Number(recipeQty);
+  if (!Number.isFinite(perUnit) || perUnit <= 0) return 0;
+  const reqQty = perUnit * Number(qtyMultiplier || 0);
+  if (!Number.isFinite(reqQty) || reqQty <= 0) return 0;
+
+  const factor = Number(conversionFactor || 1);
+  if (!Number.isFinite(factor) || factor <= 0) {
+    const err = new Error(`Invalid conversion factor for ${rawMaterialName || "raw material"}`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (consumptionUnitId && recipeUnitId === consumptionUnitId) {
+    return reqQty;
+  }
+  if (consumptionUnitId && purchaseUnitId && recipeUnitId === purchaseUnitId) {
+    // consumption_qty = purchase_qty * conversion_factor
+    return reqQty * factor;
+  }
+
+  const err = new Error(`Recipe unit mismatch for ${rawMaterialName || "raw material"}`);
+  err.statusCode = 400;
+  throw err;
+};
+
+const startOfRange = (range) => {
+  const r = String(range || "day").trim().toLowerCase();
+  const now = new Date();
+  if (r === "month") return new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+  if (r === "week") {
+    // Week starts Monday (server local timezone)
+    const day = now.getDay(); // 0=Sun ... 6=Sat
+    const diff = day === 0 ? 6 : day - 1;
+    const d = new Date(now);
+    d.setDate(now.getDate() - diff);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+  // default "day"
+  const d = new Date(now);
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+
 const createOrder = async (req, res) => {
-  const { order_type, table_id, items, guest_name, guest_phone, guest_address, tax_percentage } = req.body || {};
+  const { order_type, table_id, items, guest_name, guest_phone, guest_address, tax_percentage, selected_tax_ids } = req.body || {};
   const orderType = String(order_type || "dine_in").trim().toLowerCase();
   const allowedTypes = new Set(["dine_in", "takeaway", "delivery"]);
   if (!allowedTypes.has(orderType)) return res.status(400).json({ message: "Invalid order_type." });
@@ -124,7 +256,8 @@ const createOrder = async (req, res) => {
 
   try {
     const created = await withTenantTx(req.tenantDB, async (client) => {
-      const taxPercentage = toNonNegativeNumber(tax_percentage, "tax_percentage", 0);
+      let taxPercentage = toNonNegativeNumber(tax_percentage, "tax_percentage", 0);
+      let selectedTaxIds = normalizeTaxIds(selected_tax_ids);
       const guestName = toNullableText(guest_name, 160);
       const guestPhone = toNullableText(guest_phone, 40);
       const guestAddress = toNullableText(guest_address);
@@ -165,21 +298,39 @@ const createOrder = async (req, res) => {
         return { ...it, price, total_price };
       });
 
-      const { taxAmount, total } = computeTax(subtotal, taxPercentage);
+      let taxAmount = 0;
+      let total = subtotal;
+      let taxBreakup = {};
+      let totalTaxAmount = 0;
+      if (selectedTaxIds.length > 0) {
+        const tx = await computeTaxesFromSelection(client, subtotal, selectedTaxIds);
+        selectedTaxIds = tx.selectedTaxIds;
+        taxBreakup = tx.taxBreakup;
+        totalTaxAmount = Number(tx.totalTaxAmount || 0);
+        taxPercentage = Number(tx.taxPercentage || 0);
+        taxAmount = totalTaxAmount;
+        total = subtotal + taxAmount;
+      } else {
+        const c = computeTax(subtotal, taxPercentage);
+        taxAmount = Number(c.taxAmount || 0);
+        total = Number(c.total || 0);
+        taxBreakup = taxPercentage > 0 ? { Tax: taxAmount } : {};
+        totalTaxAmount = taxAmount;
+      }
 
       const inserted = await client.query(
         `
         INSERT INTO orders (
           id, order_number, order_type, status, table_id,
           guest_name, guest_phone, guest_address,
-          tax_percentage, tax_amount, total_amount,
+          tax_percentage, tax_amount, total_amount, selected_tax_ids, tax_breakup, total_tax_amount,
           kot_sent_at
         )
-        VALUES ($1, $2, $3, 'kot_sent', $4, $5, $6, $7, $8, $9, $10, NOW())
+        VALUES ($1, $2, $3, 'kot_sent', $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, NOW())
         RETURNING
           id, order_number, order_type, status, table_id,
           guest_name, guest_phone, guest_address,
-          tax_percentage, tax_amount,
+          tax_percentage, tax_amount, selected_tax_ids, tax_breakup, total_tax_amount,
           total_amount, total_cost, total_profit,
           kot_sent_at,
           created_at, updated_at
@@ -195,6 +346,9 @@ const createOrder = async (req, res) => {
           taxPercentage,
           taxAmount,
           total,
+          JSON.stringify(selectedTaxIds),
+          JSON.stringify(taxBreakup),
+          totalTaxAmount,
         ]
       );
 
@@ -225,7 +379,7 @@ const createOrder = async (req, res) => {
 
 const updateOrder = async (req, res) => {
   const { id } = req.params;
-  const { table_id, items, guest_name, guest_phone, guest_address, tax_percentage } = req.body || {};
+  const { table_id, items, guest_name, guest_phone, guest_address, tax_percentage, selected_tax_ids } = req.body || {};
 
   const hasItems = Array.isArray(items);
   let normalized = null;
@@ -240,7 +394,7 @@ const updateOrder = async (req, res) => {
   try {
     const updated = await withTenantTx(req.tenantDB, async (client) => {
       const ord = await client.query(
-        "SELECT id, order_type, status, table_id, tax_percentage FROM orders WHERE id = $1 LIMIT 1 FOR UPDATE",
+        "SELECT id, order_type, status, table_id, tax_percentage, selected_tax_ids, discount_amount FROM orders WHERE id = $1 LIMIT 1 FOR UPDATE",
         [id]
       );
       if (ord.rowCount === 0) {
@@ -248,23 +402,11 @@ const updateOrder = async (req, res) => {
         err.statusCode = 404;
         throw err;
       }
-      const status = ord.rows[0].status;
-      const s = String(status || "").toLowerCase();
-      // Items are editable only up to preparing, but guest/tax can be updated at served (payment step)
-      if (hasItems) {
-        const editableItems = new Set(["created", "kot_sent", "preparing"]);
-        if (!editableItems.has(s)) {
-          const err = new Error("Order items cannot be edited at this stage.");
-          err.statusCode = 400;
-          throw err;
-        }
-      } else {
-        const editableGuest = new Set(["created", "kot_sent", "preparing", "served"]);
-        if (!editableGuest.has(s)) {
-          const err = new Error("Order cannot be edited at this stage.");
-          err.statusCode = 400;
-          throw err;
-        }
+      const status = String(ord.rows[0].status || "").toLowerCase();
+      if (status === "served" || status === "completed" || status === "cancelled") {
+        const err = new Error("Order cannot be edited after served");
+        err.statusCode = 400;
+        throw err;
       }
 
       const orderType = ord.rows[0].order_type;
@@ -286,13 +428,16 @@ const updateOrder = async (req, res) => {
 
       const existingTax = Number(ord.rows[0]?.tax_percentage || 0);
       const taxPercentage = toNonNegativeNumber(tax_percentage, "tax_percentage", existingTax);
+      const selectedTaxIds = selected_tax_ids !== undefined
+        ? normalizeTaxIds(selected_tax_ids)
+        : normalizeTaxIds(ord.rows[0]?.selected_tax_ids);
       const guestName = toNullableText(guest_name, 160);
       const guestPhone = toNullableText(guest_phone, 40);
       const guestAddress = toNullableText(guest_address);
 
-      let prepared = [];
       let subtotal = 0;
 
+      // Replace items when payload includes items[]
       if (hasItems) {
         const variantIds = normalized.map((x) => x.variant_id);
         const prices = await fetchVariantPrices(client, variantIds);
@@ -304,15 +449,11 @@ const updateOrder = async (req, res) => {
           }
         }
 
-        prepared = normalized.map((it) => {
-          const price = Number(prices.get(it.variant_id) || 0);
-          const total_price = price * Number(it.quantity);
-          subtotal += total_price;
-          return { ...it, price, total_price };
-        });
-
         await client.query("DELETE FROM order_items WHERE order_id = $1", [id]);
-        for (const it of prepared) {
+        for (const it of normalized) {
+          const price = Number(prices.get(it.variant_id) || 0);
+          const totalPrice = price * Number(it.quantity);
+
           await client.query(
             `
             INSERT INTO order_items (
@@ -320,25 +461,132 @@ const updateOrder = async (req, res) => {
             )
             VALUES ($1, $2, $3, $4, $5, $6, 0, 0)
             `,
-            [randomUUID(), id, it.variant_id, it.quantity, it.price, it.total_price]
+            [randomUUID(), id, it.variant_id, it.quantity, price, totalPrice]
           );
-        }
-      } else {
-        // guest/tax-only update: compute subtotal from existing items
-        const existingItems = await client.query(
-          `
-          SELECT quantity, price, total_price
-          FROM order_items
-          WHERE order_id = $1
-          `,
-          [id]
-        );
-        for (const it of existingItems.rows || []) {
-          subtotal += Number(it.total_price || Number(it.price || 0) * Number(it.quantity || 0));
         }
       }
 
-      const { taxAmount, total } = computeTax(subtotal, taxPercentage);
+      // Always recompute subtotal from DB (source of truth)
+      const dbItems = await client.query(
+        `
+        SELECT id, variant_id, quantity, price, total_price
+        FROM order_items
+        WHERE order_id = $1
+        `,
+        [id]
+      );
+      if (dbItems.rowCount === 0) {
+        const err = new Error("Order has no items.");
+        err.statusCode = 400;
+        throw err;
+      }
+      for (const it of dbItems.rows || []) {
+        subtotal += Number(it.total_price || Number(it.price || 0) * Number(it.quantity || 0));
+      }
+
+      let taxAmount = 0;
+      let total = subtotal;
+      let outTaxPercentage = Number(taxPercentage || 0);
+      let outSelectedTaxIds = selectedTaxIds;
+      let taxBreakup = {};
+      let totalTaxAmount = 0;
+      if (outSelectedTaxIds.length > 0) {
+        const tx = await computeTaxesFromSelection(client, subtotal, outSelectedTaxIds);
+        outSelectedTaxIds = tx.selectedTaxIds;
+        outTaxPercentage = Number(tx.taxPercentage || 0);
+        taxBreakup = tx.taxBreakup;
+        totalTaxAmount = Number(tx.totalTaxAmount || 0);
+        taxAmount = totalTaxAmount;
+        total = subtotal + taxAmount;
+      } else {
+        const c = computeTax(subtotal, outTaxPercentage);
+        taxAmount = Number(c.taxAmount || 0);
+        total = Number(c.total || 0);
+        taxBreakup = outTaxPercentage > 0 ? { Tax: taxAmount } : {};
+        totalTaxAmount = taxAmount;
+      }
+
+      // Recalculate costing (recipes only) - DO NOT deduct stock here
+      let totalCost = 0;
+      for (const it of dbItems.rows || []) {
+        const qty = Number(it.quantity);
+        const totalPrice = Number(it.total_price);
+
+        const recipe = await client.query(
+          `
+          SELECT
+            ri.raw_material_id,
+            ri.quantity AS recipe_quantity,
+            ri.unit_id AS recipe_unit_id,
+            rm.name AS raw_material_name,
+            rm.purchase_price,
+            rm.purchase_unit_id,
+            rm.consumption_unit_id,
+            rm.conversion_factor
+          FROM recipe_items ri
+          JOIN raw_materials rm ON rm.id = ri.raw_material_id
+          WHERE ri.menu_item_variant_id = $1
+          `,
+          [it.variant_id]
+        );
+        if (recipe.rowCount === 0) {
+          const err = new Error("Recipe not found for one or more order items.");
+          err.statusCode = 400;
+          throw err;
+        }
+
+        let itemCost = 0;
+        for (const ing of recipe.rows) {
+          const perUnit = Number(ing.recipe_quantity);
+          if (!Number.isFinite(perUnit) || perUnit <= 0) continue;
+          const reqConsumptionQty = perUnit * qty; // recipe is in consumption unit
+
+          const purchasePrice = Number(ing.purchase_price || 0);
+          const factor = Number(ing.conversion_factor || 1);
+          if (!Number.isFinite(purchasePrice) || purchasePrice < 0) {
+            const err = new Error(`Invalid purchase price for ${ing.raw_material_name}`);
+            err.statusCode = 400;
+            throw err;
+          }
+          if (!Number.isFinite(factor) || factor <= 0) {
+            const err = new Error(`Invalid conversion factor for ${ing.raw_material_name}`);
+            err.statusCode = 400;
+            throw err;
+          }
+
+          const recipeUnitId = ing.recipe_unit_id;
+          let purchaseQty;
+          if (ing.purchase_unit_id && recipeUnitId === ing.purchase_unit_id) {
+            purchaseQty = reqConsumptionQty;
+          } else if (ing.consumption_unit_id && recipeUnitId === ing.consumption_unit_id) {
+            purchaseQty = reqConsumptionQty / factor;
+          } else {
+            const err = new Error(`Recipe unit mismatch for ${ing.raw_material_name}`);
+            err.statusCode = 400;
+            throw err;
+          }
+
+          itemCost += purchaseQty * purchasePrice;
+        }
+
+        const itemProfit = totalPrice - itemCost;
+        totalCost += itemCost;
+
+        await client.query(
+          `
+          UPDATE order_items
+          SET cost_price = $1,
+              profit = $2
+          WHERE id = $3
+          `,
+          [itemCost, itemProfit, it.id]
+        );
+      }
+
+      // Profit should reflect net revenue (discount reduces profit, tip does not affect profit)
+      const discountAmount = Number(ord.rows[0]?.discount_amount || 0);
+      const netRevenue = total - Math.max(0, discountAmount);
+      const totalProfit = netRevenue - totalCost;
 
       const out = await client.query(
         `
@@ -350,16 +598,35 @@ const updateOrder = async (req, res) => {
             tax_percentage = $5,
             tax_amount = $6,
             total_amount = $7,
+            selected_tax_ids = $8::jsonb,
+            tax_breakup = $9::jsonb,
+            total_tax_amount = $10,
+            total_cost = $11,
+            total_profit = $12,
             updated_at = NOW()
-        WHERE id = $8
+        WHERE id = $13
         RETURNING
           id, order_number, order_type, status, table_id,
           guest_name, guest_phone, guest_address,
-          tax_percentage, tax_amount,
+          tax_percentage, tax_amount, selected_tax_ids, tax_breakup, total_tax_amount,
           total_amount, total_cost, total_profit,
           created_at, updated_at
         `,
-        [orderType === "dine_in" ? tableId : null, guestName, guestPhone, guestAddress, taxPercentage, taxAmount, total, id]
+        [
+          orderType === "dine_in" ? tableId : null,
+          guestName,
+          guestPhone,
+          guestAddress,
+          outTaxPercentage,
+          taxAmount,
+          total,
+          JSON.stringify(outSelectedTaxIds),
+          JSON.stringify(taxBreakup),
+          totalTaxAmount,
+          totalCost,
+          totalProfit,
+          id,
+        ]
       );
 
       return out.rows[0];
@@ -372,6 +639,730 @@ const updateOrder = async (req, res) => {
   }
 };
 
+const updateOrderGuest = async (req, res) => {
+  const { id } = req.params;
+  const { guest_name, guest_phone, guest_address } = req.body || {};
+
+  try {
+    const updated = await withTenantTx(req.tenantDB, async (client) => {
+      const ord = await client.query("SELECT id, status FROM orders WHERE id = $1 LIMIT 1 FOR UPDATE", [id]);
+      if (ord.rowCount === 0) {
+        const err = new Error("Order not found.");
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const status = String(ord.rows[0]?.status || "").toLowerCase();
+      if (status === "completed") {
+        const err = new Error("Cannot update guest after order is completed");
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const guestName = toNullableText(guest_name, 160);
+      const guestPhone = toNullableText(guest_phone, 40);
+      const guestAddress = toNullableText(guest_address);
+
+      const out = await client.query(
+        `
+        UPDATE orders
+        SET guest_name = $1,
+            guest_phone = $2,
+            guest_address = $3,
+            updated_at = NOW()
+        WHERE id = $4
+        RETURNING
+          id, order_number, order_type, status, table_id,
+          guest_name, guest_phone, guest_address,
+          tax_percentage, tax_amount, selected_tax_ids, tax_breakup, total_tax_amount,
+          total_amount, total_cost, total_profit,
+          payment_status,
+          kot_sent_at, served_at, completed_at,
+          created_at, updated_at
+        `,
+        [guestName, guestPhone, guestAddress, id]
+      );
+
+      return out.rows[0];
+    });
+
+    return res.status(200).json({ message: "Guest details updated.", data: updated });
+  } catch (error) {
+    logError("PATCH /api/orders/:id/guest", error);
+    return res.status(error.statusCode || 500).json({ message: error?.message || "Failed to update guest details." });
+  }
+};
+
+const cancelOrder = async (req, res) => {
+  const { id } = req.params;
+  const { reason } = req.body || {};
+
+  try {
+    const out = await withTenantTx(req.tenantDB, async (client) => {
+      const ord = await client.query(
+        "SELECT id, status FROM orders WHERE id = $1 LIMIT 1 FOR UPDATE",
+        [id]
+      );
+      if (ord.rowCount === 0) {
+        const err = new Error("Order not found.");
+        err.statusCode = 404;
+        throw err;
+      }
+      const status = String(ord.rows[0]?.status || "").toLowerCase();
+      if (status === "served" || status === "completed") {
+        const err = new Error("Order cannot be cancelled after served");
+        err.statusCode = 400;
+        throw err;
+      }
+      if (status === "cancelled") {
+        return { id, status: "cancelled" };
+      }
+
+      // Cancel all items (before served) - no stock impact
+      await client.query(
+        `
+        UPDATE order_items
+        SET status = 'cancelled'
+        WHERE order_id = $1
+          AND COALESCE(status, 'active') = 'active'
+        `,
+        [id]
+      );
+
+      await client.query(
+        `
+        INSERT INTO order_adjustments (
+          id, order_id, order_item_id, type, reason, quantity, amount_impact, cost_impact, created_by, created_at
+        ) VALUES ($1, $2, NULL, 'cancel_before_served', $3, 0, 0, 0, $4, NOW())
+        `,
+        [
+          randomUUID(),
+          id,
+          String(reason || "").trim() || null,
+          req.user?.id ? String(req.user.id) : null,
+        ]
+      );
+
+      const updated = await client.query(
+        `
+        UPDATE orders
+        SET status = 'cancelled',
+            subtotal = 0,
+            tax_amount = 0,
+            total_amount = 0,
+            total_cost = 0,
+            total_profit = 0,
+            payment_status = 'unpaid',
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, order_number, status, subtotal, tax_amount, total_amount, total_cost, total_profit, payment_status, updated_at
+        `,
+        [id]
+      );
+
+      return updated.rows[0];
+    });
+
+    return res.status(200).json({
+      message: out?.status === "cancelled" ? "Order cancelled." : "Order cancelled.",
+      data: out,
+    });
+  } catch (error) {
+    logError("POST /api/orders/:id/cancel", error);
+    return res.status(error.statusCode || 500).json({ message: error?.message || "Failed to cancel order." });
+  }
+};
+
+const voidOrderItem = async (req, res) => {
+  const { id } = req.params;
+  const { order_item_id, reason } = req.body || {};
+  const itemId = String(order_item_id || "").trim();
+  const reasonText = String(reason || "").trim();
+  if (!itemId) return res.status(400).json({ message: "order_item_id is required." });
+  if (!reasonText) return res.status(400).json({ message: "reason is required." });
+
+  try {
+    const out = await withTenantTx(req.tenantDB, async (client) => {
+      const ord = await client.query(
+        "SELECT id, status, payment_status, completed_at, tax_percentage, selected_tax_ids, discount_amount, total_cost FROM orders WHERE id = $1 LIMIT 1 FOR UPDATE",
+        [id]
+      );
+      if (ord.rowCount === 0) {
+        const err = new Error("Order not found.");
+        err.statusCode = 404;
+        throw err;
+      }
+      const o = ord.rows[0];
+      const status = String(o.status || "").toLowerCase();
+      const ps = String(o.payment_status || "unpaid").toLowerCase();
+      if (status !== "served" || ps === "paid" || o.completed_at) {
+        const err = new Error("Order cannot be corrected after completion");
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const it = await client.query(
+        "SELECT id, quantity, total_price, cost_price, is_voided, status FROM order_items WHERE id = $1 AND order_id = $2 LIMIT 1 FOR UPDATE",
+        [itemId, id]
+      );
+      if (it.rowCount === 0) {
+        const err = new Error("Order item not found.");
+        err.statusCode = 404;
+        throw err;
+      }
+      if (it.rows[0].is_voided || String(it.rows[0].status || "active") !== "active") {
+        const err = new Error("Item already voided.");
+        err.statusCode = 409;
+        throw err;
+      }
+
+      await client.query(
+        "UPDATE order_items SET status = 'voided', is_voided = TRUE, void_reason = $1, voided_at = NOW() WHERE id = $2",
+        [
+          reasonText,
+          itemId,
+        ]
+      );
+
+      await client.query(
+        `
+        INSERT INTO order_adjustments (id, order_id, order_item_id, type, reason, quantity, amount_impact, cost_impact, created_by, created_at)
+        VALUES ($1, $2, $3, 'void_after_served', $4, $5, $6, $7, $8, NOW())
+        `,
+        [
+          randomUUID(),
+          id,
+          itemId,
+          reasonText,
+          Number(it.rows[0].quantity || 0),
+          Number(it.rows[0].total_price || 0),
+          Number(it.rows[0].cost_price || 0),
+          req.user?.id ? String(req.user.id) : null,
+        ]
+      );
+
+      const taxPercentage = Number(o.tax_percentage || 0);
+      const discountAmount = Number(o.discount_amount || 0);
+      const totalCost = Number(o.total_cost || 0); // keep cost as-is
+      const { subtotal, taxAmount, total, totalProfit, selectedTaxIds, taxBreakup, totalTaxAmount, taxPercentage: nextTaxPercentage } =
+        await recalcOrderTotalsForNonVoidedItems(client, id, {
+        taxPercentage,
+        selectedTaxIds: o.selected_tax_ids,
+        totalCost,
+        discountAmount,
+      });
+
+      const updated = await client.query(
+        `
+        UPDATE orders
+        SET subtotal = $1,
+            tax_amount = $2,
+            total_amount = $3,
+            selected_tax_ids = $4::jsonb,
+            tax_breakup = $5::jsonb,
+            total_tax_amount = $6,
+            tax_percentage = $7,
+            total_profit = $8,
+            updated_at = NOW()
+        WHERE id = $9
+        RETURNING id, order_number, status, payment_status, subtotal, tax_amount, total_amount, total_cost, total_profit, selected_tax_ids, tax_breakup, total_tax_amount, updated_at
+        `,
+        [
+          subtotal,
+          taxAmount,
+          total,
+          JSON.stringify(selectedTaxIds || []),
+          JSON.stringify(taxBreakup || {}),
+          Number(totalTaxAmount || 0),
+          Number(nextTaxPercentage || 0),
+          totalProfit,
+          id,
+        ]
+      );
+      return updated.rows[0];
+    });
+
+    return res.status(200).json({ message: "Item voided.", data: out });
+  } catch (error) {
+    logError("POST /api/orders/:id/void-item", error);
+    return res.status(error.statusCode || 500).json({ message: error?.message || "Failed to void item." });
+  }
+};
+
+const replaceOrderItem = async (req, res) => {
+  const { id } = req.params;
+  const { order_item_id, new_variant_id, quantity, reason } = req.body || {};
+  const itemId = String(order_item_id || "").trim();
+  const newVariantId = String(new_variant_id || "").trim();
+  const qty = Number(quantity);
+  const reasonText = String(reason || "").trim();
+  if (!itemId) return res.status(400).json({ message: "order_item_id is required." });
+  if (!newVariantId) return res.status(400).json({ message: "new_variant_id is required." });
+  if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ message: "quantity must be > 0." });
+  if (!reasonText) return res.status(400).json({ message: "reason is required." });
+
+  try {
+    const out = await withTenantTx(req.tenantDB, async (client) => {
+      const ord = await client.query(
+        "SELECT id, status, payment_status, completed_at, tax_percentage, selected_tax_ids, discount_amount, total_cost FROM orders WHERE id = $1 LIMIT 1 FOR UPDATE",
+        [id]
+      );
+      if (ord.rowCount === 0) {
+        const err = new Error("Order not found.");
+        err.statusCode = 404;
+        throw err;
+      }
+      const o = ord.rows[0];
+      const status = String(o.status || "").toLowerCase();
+      const ps = String(o.payment_status || "unpaid").toLowerCase();
+      if (status !== "served" || ps === "paid" || o.completed_at) {
+        const err = new Error("Order cannot be corrected after completion");
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const it = await client.query(
+        "SELECT id, variant_id, quantity, total_price, is_voided, status FROM order_items WHERE id = $1 AND order_id = $2 LIMIT 1 FOR UPDATE",
+        [itemId, id]
+      );
+      if (it.rowCount === 0) {
+        const err = new Error("Order item not found.");
+        err.statusCode = 404;
+        throw err;
+      }
+      if (it.rows[0].is_voided || String(it.rows[0].status || "active") !== "active") {
+        const err = new Error("Only active items can be replaced.");
+        err.statusCode = 409;
+        throw err;
+      }
+
+      // Auto-void original item (single replacement action)
+      await client.query(
+        "UPDATE order_items SET status = 'voided', is_voided = TRUE, void_reason = $1, voided_at = NOW() WHERE id = $2",
+        [reasonText, itemId]
+      );
+
+      const prices = await fetchVariantPrices(client, [newVariantId]);
+      if (!prices.has(newVariantId)) {
+        const err = new Error("Replacement variant does not exist.");
+        err.statusCode = 400;
+        throw err;
+      }
+      const newPrice = Number(prices.get(newVariantId) || 0);
+      const newTotalPrice = newPrice * qty;
+
+      // Add new chargeable replacement item
+      const newItemId = randomUUID();
+      await client.query(
+        `
+        INSERT INTO order_items (id, order_id, variant_id, quantity, price, total_price, cost_price, profit, is_voided, status)
+        VALUES ($1, $2, $3, $4, $5, $6, 0, 0, FALSE, 'replaced')
+        `,
+        [newItemId, id, newVariantId, qty, newPrice, newTotalPrice]
+      );
+
+      // Deduct stock again + snapshot consumption + compute replacement cost
+      const recipe = await client.query(
+        `
+        SELECT
+          ri.raw_material_id,
+          ri.quantity AS recipe_quantity,
+          ri.unit_id AS recipe_unit_id,
+          rm.name AS raw_material_name,
+          rm.purchase_price,
+          rm.purchase_unit_id,
+          rm.consumption_unit_id,
+          rm.conversion_factor
+        FROM recipe_items ri
+        JOIN raw_materials rm ON rm.id = ri.raw_material_id
+        WHERE ri.menu_item_variant_id = $1
+        `,
+        [newVariantId]
+      );
+      if (recipe.rowCount === 0) {
+        const err = new Error("Recipe not found for replacement item.");
+        err.statusCode = 400;
+        throw err;
+      }
+
+      let replacementCost = 0;
+      for (const ing of recipe.rows) {
+        const purchasePrice = Number(ing.purchase_price || 0);
+        if (!Number.isFinite(purchasePrice) || purchasePrice < 0) {
+          const err = new Error(`Invalid purchase price for ${ing.raw_material_name}`);
+          err.statusCode = 400;
+          throw err;
+        }
+
+        const consumptionQty = toConsumptionQty({
+          recipeQty: ing.recipe_quantity,
+          recipeUnitId: ing.recipe_unit_id,
+          qtyMultiplier: qty,
+          consumptionUnitId: ing.consumption_unit_id,
+          purchaseUnitId: ing.purchase_unit_id,
+          conversionFactor: ing.conversion_factor,
+          rawMaterialName: ing.raw_material_name,
+        });
+
+        const factor = Number(ing.conversion_factor || 1);
+        const purchaseQty = consumptionQty > 0 ? consumptionQty / factor : 0;
+        replacementCost += purchaseQty * purchasePrice;
+
+        if (consumptionQty > 0) {
+          if (!ing.consumption_unit_id) {
+            const err = new Error(`Consumption unit not configured for ${ing.raw_material_name}`);
+            err.statusCode = 400;
+            throw err;
+          }
+          await client.query(
+            `
+            INSERT INTO order_item_consumptions (id, order_id, order_item_id, raw_material_id, quantity_used, created_at)
+            VALUES ($1, $2, $3, $4, $5, NOW())
+            `,
+            [randomUUID(), id, newItemId, ing.raw_material_id, consumptionQty]
+          );
+        }
+      }
+
+      await deductStockByVariantWithClient(client, newVariantId, { multiplier: qty });
+
+      // replacement item profit = revenue(actual) - cost
+      await client.query("UPDATE order_items SET cost_price = $1, profit = $2 WHERE id = $3", [
+        replacementCost,
+        newTotalPrice - replacementCost,
+        newItemId,
+      ]);
+
+      const nextTotalCost = Number(o.total_cost || 0) + replacementCost;
+
+      const taxPercentage = Number(o.tax_percentage || 0);
+      const discountAmount = Number(o.discount_amount || 0);
+      const { subtotal, taxAmount, total, totalProfit, selectedTaxIds, taxBreakup, totalTaxAmount, taxPercentage: nextTaxPercentage } =
+        await recalcOrderTotalsForNonVoidedItems(client, id, {
+        taxPercentage,
+        selectedTaxIds: o.selected_tax_ids,
+        totalCost: nextTotalCost,
+        discountAmount,
+      });
+
+      await client.query(
+        `
+        INSERT INTO order_adjustments (id, order_id, order_item_id, type, reason, quantity, amount_impact, cost_impact, created_by, created_at)
+        VALUES ($1, $2, $3, 'replacement', $4, $5, $6, $7, $8, NOW())
+        `,
+        [
+          randomUUID(),
+          id,
+          itemId,
+          reasonText,
+          qty,
+          newTotalPrice,
+          replacementCost,
+          req.user?.id ? String(req.user.id) : null,
+        ]
+      );
+
+      const updated = await client.query(
+        `
+        UPDATE orders
+        SET subtotal = $1,
+            tax_amount = $2,
+            total_amount = $3,
+            selected_tax_ids = $4::jsonb,
+            tax_breakup = $5::jsonb,
+            total_tax_amount = $6,
+            tax_percentage = $7,
+            total_cost = $8,
+            total_profit = $9,
+            updated_at = NOW()
+        WHERE id = $10
+        RETURNING id, order_number, status, payment_status, subtotal, tax_amount, total_amount, total_cost, total_profit, selected_tax_ids, tax_breakup, total_tax_amount, updated_at
+        `,
+        [
+          subtotal,
+          taxAmount,
+          total,
+          JSON.stringify(selectedTaxIds || []),
+          JSON.stringify(taxBreakup || {}),
+          Number(totalTaxAmount || 0),
+          Number(nextTaxPercentage || 0),
+          nextTotalCost,
+          totalProfit,
+          id,
+        ]
+      );
+
+      return updated.rows[0];
+    });
+
+    return res.status(200).json({ message: "Replacement created.", data: out });
+  } catch (error) {
+    logError("POST /api/orders/:id/replace-item", error);
+    return res.status(error.statusCode || 500).json({ message: error?.message || "Failed to replace item." });
+  }
+};
+
+const correctOrder = async (req, res) => {
+  const { id } = req.params;
+  const { items } = req.body || {};
+
+  let normalized;
+  try {
+    normalized = normalizeItems(items);
+  } catch (e) {
+    return res.status(e.statusCode || 400).json({ message: e.message });
+  }
+
+  try {
+    const updated = await withTenantTx(req.tenantDB, async (client) => {
+      const ord = await client.query(
+        `
+        SELECT id, status, payment_status, completed_at, tax_percentage, selected_tax_ids, discount_amount, order_type, table_id
+        FROM orders
+        WHERE id = $1
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [id]
+      );
+      if (ord.rowCount === 0) {
+        const err = new Error("Order not found.");
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const o = ord.rows[0];
+      const status = String(o.status || "").toLowerCase();
+      const paymentStatus = String(o.payment_status || "unpaid").toLowerCase();
+      if (status !== "served" || paymentStatus === "paid" || o.completed_at) {
+        const err = new Error("Order cannot be corrected after completion");
+        err.statusCode = 400;
+        throw err;
+      }
+
+      // Reverse old consumption snapshot (increase stock back)
+      const oldCons = await client.query(
+        `
+        SELECT
+          c.raw_material_id,
+          c.quantity_used,
+          rm.consumption_unit_id
+        FROM order_item_consumptions c
+        JOIN raw_materials rm ON rm.id = c.raw_material_id
+        WHERE c.order_id = $1
+        `,
+        [id]
+      );
+
+      for (const r of oldCons.rows || []) {
+        const unitId = String(r.consumption_unit_id || "").trim();
+        if (!unitId) {
+          const err = new Error("Consumption unit not configured for one or more raw materials.");
+          err.statusCode = 400;
+          throw err;
+        }
+        await addStockWithClient(client, {
+          raw_material_id: r.raw_material_id,
+          quantity: Number(r.quantity_used || 0),
+          unit_id: unitId,
+        });
+      }
+
+      // Replace order_items
+      const variantIds = normalized.map((x) => x.variant_id);
+      const prices = await fetchVariantPrices(client, variantIds);
+      for (const it of normalized) {
+        if (!prices.has(it.variant_id)) {
+          const err = new Error("One or more variants do not exist.");
+          err.statusCode = 400;
+          throw err;
+        }
+      }
+
+      await client.query("DELETE FROM order_items WHERE order_id = $1", [id]);
+
+      const insertedItems = [];
+      for (const it of normalized) {
+        const price = Number(prices.get(it.variant_id) || 0);
+        const totalPrice = price * Number(it.quantity);
+        const itemId = randomUUID();
+        await client.query(
+          `
+          INSERT INTO order_items (
+            id, order_id, variant_id, quantity, price, total_price, cost_price, profit
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, 0, 0)
+          `,
+          [itemId, id, it.variant_id, it.quantity, price, totalPrice]
+        );
+        insertedItems.push({ id: itemId, variant_id: it.variant_id, quantity: it.quantity, total_price: totalPrice });
+      }
+
+      // Recalculate billing from new items
+      const subtotal = insertedItems.reduce((s, it) => s + Number(it.total_price || 0), 0);
+      let taxPercentage = Number(o.tax_percentage || 0);
+      let selectedTaxIds = normalizeTaxIds(o.selected_tax_ids);
+      let taxBreakup = {};
+      let totalTaxAmount = 0;
+      let taxAmount = 0;
+      let total = subtotal;
+      if (selectedTaxIds.length > 0) {
+        const tx = await computeTaxesFromSelection(client, subtotal, selectedTaxIds);
+        selectedTaxIds = tx.selectedTaxIds;
+        taxBreakup = tx.taxBreakup;
+        totalTaxAmount = Number(tx.totalTaxAmount || 0);
+        taxPercentage = Number(tx.taxPercentage || 0);
+        taxAmount = totalTaxAmount;
+        total = subtotal + taxAmount;
+      } else {
+        const c = computeTax(subtotal, taxPercentage);
+        taxAmount = Number(c.taxAmount || 0);
+        total = Number(c.total || 0);
+        taxBreakup = taxPercentage > 0 ? { Tax: taxAmount } : {};
+        totalTaxAmount = taxAmount;
+      }
+
+      // Delete old snapshot rows (after reversing)
+      await client.query("DELETE FROM order_item_consumptions WHERE order_id = $1", [id]);
+
+      // Apply new consumption: cost calc + deduct stock + insert snapshot
+      let totalCost = 0;
+      for (const it of insertedItems) {
+        const qty = Number(it.quantity);
+        const totalPrice = Number(it.total_price);
+
+        const recipe = await client.query(
+          `
+          SELECT
+            ri.raw_material_id,
+            ri.quantity AS recipe_quantity,
+            ri.unit_id AS recipe_unit_id,
+            rm.name AS raw_material_name,
+            rm.purchase_price,
+            rm.purchase_unit_id,
+            rm.consumption_unit_id,
+            rm.conversion_factor
+          FROM recipe_items ri
+          JOIN raw_materials rm ON rm.id = ri.raw_material_id
+          WHERE ri.menu_item_variant_id = $1
+          `,
+          [it.variant_id]
+        );
+        if (recipe.rowCount === 0) {
+          const err = new Error("Recipe not found for one or more order items.");
+          err.statusCode = 400;
+          throw err;
+        }
+
+        let itemCost = 0;
+        for (const ing of recipe.rows) {
+          const purchasePrice = Number(ing.purchase_price || 0);
+          if (!Number.isFinite(purchasePrice) || purchasePrice < 0) {
+            const err = new Error(`Invalid purchase price for ${ing.raw_material_name}`);
+            err.statusCode = 400;
+            throw err;
+          }
+
+          const consumptionQty = toConsumptionQty({
+            recipeQty: ing.recipe_quantity,
+            recipeUnitId: ing.recipe_unit_id,
+            qtyMultiplier: qty,
+            consumptionUnitId: ing.consumption_unit_id,
+            purchaseUnitId: ing.purchase_unit_id,
+            conversionFactor: ing.conversion_factor,
+            rawMaterialName: ing.raw_material_name,
+          });
+
+          if (consumptionQty > 0) {
+            if (!ing.consumption_unit_id) {
+              const err = new Error(`Consumption unit not configured for ${ing.raw_material_name}`);
+              err.statusCode = 400;
+              throw err;
+            }
+
+            // For costing, convert consumption -> purchase if needed
+            const factor = Number(ing.conversion_factor || 1);
+            let purchaseQty;
+            if (ing.purchase_unit_id && ing.recipe_unit_id === ing.purchase_unit_id) {
+              // recipe unit was purchase => req qty is purchase qty; consumptionQty derived above
+              purchaseQty = Number(ing.recipe_quantity) * qty;
+            } else {
+              // recipe unit is consumption => purchase_qty = consumption_qty / factor
+              purchaseQty = consumptionQty / factor;
+            }
+            itemCost += purchaseQty * purchasePrice;
+
+            await client.query(
+              `
+              INSERT INTO order_item_consumptions (
+                id, order_id, order_item_id, raw_material_id, quantity_used, created_at
+              )
+              VALUES ($1, $2, $3, $4, $5, NOW())
+              `,
+              [randomUUID(), id, it.id, ing.raw_material_id, consumptionQty]
+            );
+          }
+        }
+
+        // Deduct stock for this variant
+        await deductStockByVariantWithClient(client, it.variant_id, { multiplier: qty });
+
+        const profit = totalPrice - itemCost;
+        totalCost += itemCost;
+        await client.query(
+          `
+          UPDATE order_items
+          SET cost_price = $1,
+              profit = $2
+          WHERE id = $3
+          `,
+          [itemCost, profit, it.id]
+        );
+      }
+
+      // Profit should reflect net revenue (discount reduces profit, tip does not affect profit)
+      const discountAmount = Number(o.discount_amount || 0);
+      const netRevenue = total - Math.max(0, discountAmount);
+      const totalProfit = netRevenue - totalCost;
+
+      const out = await client.query(
+        `
+        UPDATE orders
+        SET tax_amount = $1,
+            total_amount = $2,
+            selected_tax_ids = $3::jsonb,
+            tax_breakup = $4::jsonb,
+            total_tax_amount = $5,
+            tax_percentage = $6,
+            total_cost = $7,
+            total_profit = $8,
+            updated_at = NOW()
+        WHERE id = $9
+        RETURNING id, order_number, status, payment_status, tax_amount, total_amount, total_cost, total_profit, selected_tax_ids, tax_breakup, total_tax_amount, updated_at
+        `,
+        [
+          taxAmount,
+          total,
+          JSON.stringify(selectedTaxIds || []),
+          JSON.stringify(taxBreakup || {}),
+          totalTaxAmount,
+          taxPercentage,
+          totalCost,
+          totalProfit,
+          id,
+        ]
+      );
+
+      return out.rows[0];
+    });
+
+    return res.status(200).json({ message: "Order corrected successfully", data: updated });
+  } catch (error) {
+    logError("PUT /api/orders/:id/correct", error);
+    return res.status(error.statusCode || 500).json({ message: error?.message || "Failed to correct order." });
+  }
+};
+
 const listOrders = async (req, res) => {
   try {
     const params = parseListParams(req.query, { defaultSortBy: "created_at", defaultOrder: "DESC" });
@@ -379,10 +1370,17 @@ const listOrders = async (req, res) => {
 
     const statusFilter = String(req.query?.status || "").trim().toLowerCase();
     const allowedStatuses = new Set(["created", "kot_sent", "preparing", "ready", "served", "completed", "cancelled"]);
+    const allowedStatusGroups = new Set(["all", "active", "completed", "cancelled"]);
     const status = allowedStatuses.has(statusFilter) ? statusFilter : "";
+    const statusGroup = allowedStatusGroups.has(statusFilter) ? statusFilter : "";
 
     const whereParts = [];
     const args = [];
+    const range = String(req.query?.range || "day").trim().toLowerCase();
+    const allowedRanges = new Set(["day", "week", "month"]);
+    const rangeStart = startOfRange(allowedRanges.has(range) ? range : "day");
+    args.push(rangeStart);
+    whereParts.push(`o.created_at >= $${args.length}`);
     if (params.search) {
       args.push(`%${params.search}%`);
       whereParts.push(`(o.order_number ILIKE $${args.length} OR t.name ILIKE $${args.length})`);
@@ -390,6 +1388,12 @@ const listOrders = async (req, res) => {
     if (status) {
       args.push(status);
       whereParts.push(`o.status = $${args.length}`);
+    } else if (statusGroup === "active") {
+      whereParts.push(`o.status NOT IN ('completed', 'cancelled')`);
+    } else if (statusGroup === "completed") {
+      whereParts.push(`o.status = 'completed'`);
+    } else if (statusGroup === "cancelled") {
+      whereParts.push(`o.status = 'cancelled'`);
     }
     const where = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
 
@@ -427,6 +1431,9 @@ const listOrders = async (req, res) => {
         o.guest_address,
         o.tax_percentage,
         o.tax_amount,
+        o.selected_tax_ids,
+        o.tax_breakup,
+        o.total_tax_amount,
         o.table_id,
         t.name AS table_name,
         tt.name AS table_type_name,
@@ -455,6 +1462,87 @@ const listOrders = async (req, res) => {
   }
 };
 
+const listSelectableOrders = async (req, res) => {
+  try {
+    const mode = String(req.query?.mode || "").trim().toLowerCase(); // cancel | void | replacement
+    const allowedModes = new Set(["cancel", "void", "replacement"]);
+    if (!allowedModes.has(mode)) return res.status(400).json({ message: "Invalid mode." });
+    const scope = String(req.query?.scope || "").trim().toLowerCase(); // active | cancelled (cancel mode only)
+
+    const params = parseListParams(req.query, { defaultSortBy: "created_at", defaultOrder: "DESC" });
+
+    const range = String(req.query?.range || "day").trim().toLowerCase();
+    const allowedRanges = new Set(["day", "week", "month"]);
+    const rangeStart = startOfRange(allowedRanges.has(range) ? range : "day");
+
+    const whereParts = ["o.created_at >= $1"];
+    const args = [rangeStart];
+
+    if (params.search) {
+      args.push(`%${params.search}%`);
+      whereParts.push(`(o.order_number ILIKE $${args.length})`);
+    }
+
+    if (mode === "cancel") {
+      if (scope === "cancelled") {
+        whereParts.push(`o.status = 'cancelled'`);
+      } else {
+        whereParts.push(`o.status NOT IN ('served', 'completed', 'cancelled')`);
+      }
+    } else {
+      whereParts.push(`o.status = 'served'`);
+      whereParts.push(`COALESCE(o.payment_status, 'unpaid') <> 'paid'`);
+      whereParts.push(`o.completed_at IS NULL`);
+    }
+
+    const where = `WHERE ${whereParts.join(" AND ")}`;
+
+    const totalQ = await req.tenantDB.query(
+      `
+      SELECT COUNT(*)::int AS total
+      FROM orders o
+      ${where}
+      `,
+      args
+    );
+    const total = totalQ.rows[0]?.total ?? 0;
+
+    const dataArgs = [...args, params.limit, params.offset];
+    const limitIdx = dataArgs.length - 1;
+    const offsetIdx = dataArgs.length;
+
+    const dataQ = await req.tenantDB.query(
+      `
+      SELECT
+        o.id AS order_id,
+        o.order_number,
+        o.created_at,
+        o.order_type,
+        o.status,
+        o.payment_status,
+        o.table_id,
+        t.name AS table_name,
+        o.guest_name,
+        o.total_amount
+      FROM orders o
+      LEFT JOIN tables t ON t.id = o.table_id
+      ${where}
+      ORDER BY o.created_at DESC
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
+      `,
+      dataArgs
+    );
+
+    return res.status(200).json({
+      orders: dataQ.rows || [],
+      pagination: buildPagination({ total, page: params.page, limit: params.limit }),
+    });
+  } catch (error) {
+    logError("GET /api/orders/selectable", error);
+    return res.status(500).json({ message: "Failed to fetch selectable orders." });
+  }
+};
+
 const listLiveOrders = async (req, res) => {
   try {
     const typeFilter = String(req.query?.type || "all").trim().toLowerCase();
@@ -463,10 +1551,15 @@ const listLiveOrders = async (req, res) => {
 
     const params = parseListParams(req.query, { defaultSortBy: "created_at", defaultOrder: "DESC" });
 
-    // Live orders should never include completed orders
-    const statuses = ["kot_sent", "preparing", "ready", "served"];
+    // Live orders include full lifecycle up to completion (exclude cancelled)
+    const statuses = ["created", "kot_sent", "preparing", "ready", "served", "completed"];
     const whereParts = ["o.status = ANY($1::text[])"];
     const args = [statuses];
+    const range = String(req.query?.range || "day").trim().toLowerCase();
+    const allowedRanges = new Set(["day", "week", "month"]);
+    const rangeStart = startOfRange(allowedRanges.has(range) ? range : "day");
+    args.push(rangeStart);
+    whereParts.push(`o.created_at >= $${args.length}`);
     if (type !== "all") {
       args.push(type);
       whereParts.push(`o.order_type = $${args.length}`);
@@ -500,6 +1593,7 @@ const listLiveOrders = async (req, res) => {
         o.completed_at,
         o.discount_amount,
         o.tip_amount,
+        o.payment_status,
         t.name AS table_name
       FROM orders o
       LEFT JOIN tables t ON t.id = o.table_id
@@ -522,7 +1616,10 @@ const listLiveOrders = async (req, res) => {
         oi.order_id,
         i.name AS item_name,
         v.name AS variant_name,
-        oi.quantity
+        oi.quantity,
+        oi.status,
+        oi.is_voided,
+        oi.voided_at
       FROM order_items oi
       JOIN menu_item_variants v ON v.id = oi.variant_id
       JOIN menu_items i ON i.id = v.item_id
@@ -539,6 +1636,9 @@ const listLiveOrders = async (req, res) => {
         item_name: it.item_name,
         variant_name: it.variant_name,
         quantity: it.quantity,
+        status: it.status,
+        is_voided: it.is_voided,
+        voided_at: it.voided_at,
       });
       itemsByOrder.set(it.order_id, arr);
     }
@@ -554,6 +1654,7 @@ const listLiveOrders = async (req, res) => {
         completed_at: o.completed_at,
         discount_amount: o.discount_amount,
         tip_amount: o.tip_amount,
+        payment_status: o.payment_status,
         table_name: o.table_name,
         items: itemsByOrder.get(o.order_id) || [],
       })),
@@ -586,6 +1687,9 @@ const getOrder = async (req, res) => {
         o.guest_address,
         o.tax_percentage,
         o.tax_amount,
+        o.selected_tax_ids,
+        o.tax_breakup,
+        o.total_tax_amount,
         o.table_id,
         t.name AS table_name,
         tt.name AS table_type_name,
@@ -615,7 +1719,11 @@ const getOrder = async (req, res) => {
         oi.price,
         oi.total_price,
         oi.cost_price,
-        oi.profit
+        oi.profit,
+        oi.status,
+        oi.is_voided,
+        oi.void_reason,
+        oi.voided_at
       FROM order_items oi
       JOIN menu_item_variants v ON v.id = oi.variant_id
       JOIN menu_items i ON i.id = v.item_id
@@ -625,10 +1733,35 @@ const getOrder = async (req, res) => {
       [id]
     );
 
+    const adjustments = await req.tenantDB.query(
+      `
+      SELECT
+        a.id,
+        a.type,
+        a.reason,
+        a.quantity,
+        a.amount_impact,
+        a.cost_impact,
+        a.created_by,
+        a.created_at,
+        a.order_item_id,
+        i.name AS item_name,
+        v.name AS variant_name
+      FROM order_adjustments a
+      LEFT JOIN order_items oi ON oi.id = a.order_item_id
+      LEFT JOIN menu_item_variants v ON v.id = oi.variant_id
+      LEFT JOIN menu_items i ON i.id = v.item_id
+      WHERE a.order_id = $1
+      ORDER BY a.created_at DESC
+      `,
+      [id]
+    );
+
     return res.status(200).json({
       data: {
         ...ord.rows[0],
         items: items.rows,
+        adjustments: adjustments.rows || [],
       },
     });
   } catch (error) {
@@ -659,6 +1792,9 @@ const getActiveOrderByTable = async (req, res) => {
         o.guest_address,
         o.tax_percentage,
         o.tax_amount,
+        o.selected_tax_ids,
+        o.tax_breakup,
+        o.total_tax_amount,
         o.discount_amount,
         o.tip_amount,
         o.total_amount
@@ -721,7 +1857,7 @@ const updateOrderStatus = async (req, res) => {
   try {
     const out = await withTenantTx(req.tenantDB, async (client) => {
       const ord = await client.query(
-        "SELECT id, status, kot_sent_at, served_at, completed_at, payment_status FROM orders WHERE id = $1 LIMIT 1 FOR UPDATE",
+        "SELECT id, status, tax_percentage, selected_tax_ids, discount_amount, kot_sent_at, served_at, completed_at, payment_status FROM orders WHERE id = $1 LIMIT 1 FOR UPDATE",
         [id]
       );
       if (ord.rowCount === 0) {
@@ -770,6 +1906,7 @@ const updateOrderStatus = async (req, res) => {
         SELECT id, variant_id, quantity, price, total_price
         FROM order_items
         WHERE order_id = $1
+          AND COALESCE(status, 'active') = 'active'
         `,
         [id]
       );
@@ -779,13 +1916,13 @@ const updateOrderStatus = async (req, res) => {
         throw err;
       }
 
-      let totalAmount = 0;
+      let subtotal = 0;
       let totalCost = 0;
 
       for (const it of items.rows) {
         const qty = Number(it.quantity);
         const totalPrice = Number(it.total_price);
-        totalAmount += totalPrice;
+        subtotal += totalPrice;
 
         // Fetch recipe ingredients with raw material pricing/config
         const recipe = await client.query(
@@ -850,6 +1987,36 @@ const updateOrderStatus = async (req, res) => {
         // Deduct stock using existing stock logic (conversion + locking), multiplied by item quantity
         await deductStockByVariantWithClient(client, it.variant_id, { multiplier: qty });
 
+        // Snapshot consumption in consumption unit for correction flow
+        for (const ing of recipe.rows) {
+          const consumptionQty = toConsumptionQty({
+            recipeQty: ing.recipe_quantity,
+            recipeUnitId: ing.recipe_unit_id,
+            qtyMultiplier: qty,
+            consumptionUnitId: ing.consumption_unit_id,
+            purchaseUnitId: ing.purchase_unit_id,
+            conversionFactor: ing.conversion_factor,
+            rawMaterialName: ing.raw_material_name,
+          });
+
+          if (consumptionQty > 0) {
+            if (!ing.consumption_unit_id) {
+              const err = new Error(`Consumption unit not configured for ${ing.raw_material_name}`);
+              err.statusCode = 400;
+              throw err;
+            }
+            await client.query(
+              `
+              INSERT INTO order_item_consumptions (
+                id, order_id, order_item_id, raw_material_id, quantity_used, created_at
+              )
+              VALUES ($1, $2, $3, $4, $5, NOW())
+              `,
+              [randomUUID(), id, it.id, ing.raw_material_id, consumptionQty]
+            );
+          }
+        }
+
         const profit = totalPrice - itemCost;
         totalCost += itemCost;
 
@@ -864,21 +2031,61 @@ const updateOrderStatus = async (req, res) => {
         );
       }
 
-      const totalProfit = totalAmount - totalCost;
+      let taxPercentage = Number(ord.rows[0]?.tax_percentage || 0);
+      let selectedTaxIds = normalizeTaxIds(ord.rows[0]?.selected_tax_ids);
+      let taxBreakup = {};
+      let totalTaxAmount = 0;
+      let taxAmount = 0;
+      let total = subtotal;
+      if (selectedTaxIds.length > 0) {
+        const tx = await computeTaxesFromSelection(client, subtotal, selectedTaxIds);
+        selectedTaxIds = tx.selectedTaxIds;
+        taxBreakup = tx.taxBreakup;
+        totalTaxAmount = Number(tx.totalTaxAmount || 0);
+        taxPercentage = Number(tx.taxPercentage || 0);
+        taxAmount = totalTaxAmount;
+        total = subtotal + taxAmount;
+      } else {
+        const c = computeTax(subtotal, taxPercentage);
+        taxAmount = Number(c.taxAmount || 0);
+        total = Number(c.total || 0);
+        taxBreakup = taxPercentage > 0 ? { Tax: taxAmount } : {};
+        totalTaxAmount = taxAmount;
+      }
+      // Profit should reflect net revenue (discount reduces profit, tip does not affect profit)
+      const discountAmount = Number(ord.rows[0]?.discount_amount || 0);
+      const netRevenue = total - Math.max(0, discountAmount);
+      const totalProfit = netRevenue - totalCost;
 
       const updated = await client.query(
         `
         UPDATE orders
         SET status = 'served',
             total_amount = $1,
-            total_cost = $2,
-            total_profit = $3,
+            tax_amount = $2,
+            selected_tax_ids = $3::jsonb,
+            tax_breakup = $4::jsonb,
+            total_tax_amount = $5,
+            tax_percentage = $6,
+            total_cost = $7,
+            total_profit = $8,
+            payment_status = 'unpaid',
             served_at = COALESCE(served_at, NOW()),
             updated_at = NOW()
-        WHERE id = $4
-        RETURNING id, order_number, status, kot_sent_at, served_at, completed_at, total_amount, total_cost, total_profit, updated_at
+        WHERE id = $9
+        RETURNING id, order_number, status, kot_sent_at, served_at, completed_at, tax_amount, total_amount, total_cost, total_profit, payment_status, selected_tax_ids, tax_breakup, total_tax_amount, updated_at
         `,
-        [totalAmount, totalCost, totalProfit, id]
+        [
+          total,
+          taxAmount,
+          JSON.stringify(selectedTaxIds || []),
+          JSON.stringify(taxBreakup || {}),
+          totalTaxAmount,
+          taxPercentage,
+          totalCost,
+          totalProfit,
+          id,
+        ]
       );
 
       return updated.rows[0];
@@ -896,7 +2103,13 @@ const updateOrderStatus = async (req, res) => {
 module.exports = {
   createOrder,
   updateOrder,
+  updateOrderGuest,
+  cancelOrder,
+  voidOrderItem,
+  replaceOrderItem,
+  correctOrder,
   listOrders,
+  listSelectableOrders,
   listLiveOrders,
   getOrder,
   getActiveOrderByTable,

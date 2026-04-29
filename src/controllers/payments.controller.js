@@ -87,6 +87,8 @@ const createPayment = async (req, res) => {
           id,
           status,
           total_amount,
+          total_tax_amount,
+          tax_amount,
           guest_name,
           guest_phone,
           payment_status
@@ -130,12 +132,6 @@ const createPayment = async (req, res) => {
         throw err;
       }
 
-      if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
-        const err = new Error("paid_amount must be greater than 0.");
-        err.statusCode = 400;
-        throw err;
-      }
-
       // Auto derive discount/tip from what customer paid (order total).
       // - If paid < total => discount = total - paid, tip = 0, final_payable = paid
       // - If paid > total => tip = paid - total, discount = 0, final_payable = total
@@ -152,6 +148,19 @@ const createPayment = async (req, res) => {
       }
 
       const tipAmount = Math.max(0, paidAmount - finalPayable);
+
+      // Allow ₹0 completion only when final payable + tip is ₹0.
+      // (Used when all items are voided and totals are recalculated to 0.)
+      if (!Number.isFinite(paidAmount) || paidAmount < 0) {
+        const err = new Error("paid_amount must be >= 0.");
+        err.statusCode = 400;
+        throw err;
+      }
+      if (paidAmount === 0 && (finalPayable > 0 || tipAmount > 0)) {
+        const err = new Error("paid_amount must be greater than 0.");
+        err.statusCode = 400;
+        throw err;
+      }
 
       const existing = await client.query("SELECT id FROM payments WHERE order_id = $1 LIMIT 1", [orderId]);
       if (existing.rowCount > 0) {
@@ -188,11 +197,23 @@ const createPayment = async (req, res) => {
             payment_status = 'paid',
             discount_amount = $1,
             tip_amount = $2,
+            total_profit = (total_amount - $1) - total_cost,
             completed_at = COALESCE(completed_at, NOW()),
             updated_at = NOW()
         WHERE id = $3
         `,
         [discountAmount, tipAmount, orderId]
+      );
+
+      const outputGstAmount = Number(order.total_tax_amount || order.tax_amount || 0);
+      await client.query(
+        `
+        INSERT INTO gst_ledger (id, type, source, source_id, amount)
+        VALUES ($1, 'output', 'order', $2, $3)
+        ON CONFLICT (type, source, source_id)
+        DO UPDATE SET amount = EXCLUDED.amount, updated_at = NOW()
+        `,
+        [randomUUID(), orderId, outputGstAmount]
       );
 
       return inserted.rows[0];

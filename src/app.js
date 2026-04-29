@@ -18,6 +18,8 @@ const tablesRoutes = require("./routes/tables.routes");
 const ordersRoutes = require("./routes/orders.routes");
 const kitchenRoutes = require("./routes/kitchen.routes");
 const paymentsRoutes = require("./routes/payments.routes");
+const reportsRoutes = require("./routes/reports.routes");
+const taxesRoutes = require("./routes/taxes.routes");
 const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
@@ -50,6 +52,8 @@ app.use("/api/tables", tablesRoutes);
 app.use("/api/orders", ordersRoutes);
 app.use("/api/kitchen", kitchenRoutes);
 app.use("/api/payments", paymentsRoutes);
+app.use("/api/reports", reportsRoutes);
+app.use("/api/taxes", taxesRoutes);
 app.use(errorHandler);
 
 module.exports = app;

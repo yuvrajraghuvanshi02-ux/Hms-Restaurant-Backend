@@ -24,6 +24,49 @@ const toPositiveNumber = (value, label) => {
   return n;
 };
 
+const toNonNegativeNumber = (value, label) => {
+  const n = Number(value);
+  if (Number.isNaN(n) || !Number.isFinite(n) || n < 0) {
+    const err = new Error(`${label} must be greater than or equal to 0.`);
+    err.statusCode = 400;
+    throw err;
+  }
+  return n;
+};
+
+const normalizeTaxIds = (value) => {
+  const arr = Array.isArray(value) ? value : [];
+  const seen = new Set();
+  const out = [];
+  for (const v of arr) {
+    const s = String(v || "").trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+};
+
+const computePurchaseTaxesFromSelection = async (client, subtotal, selectedTaxIds) => {
+  const ids = normalizeTaxIds(selectedTaxIds);
+  if (!ids.length) {
+    return { selectedTaxIds: [], gstPercentage: 0, gstAmount: 0 };
+  }
+  const q = await client.query(
+    `
+    SELECT id, percentage
+    FROM taxes
+    WHERE id = ANY($1::uuid[]) AND is_active = TRUE
+    `,
+    [ids]
+  );
+  const rows = q.rows || [];
+  const selected = rows.map((r) => String(r.id));
+  const gstPercentage = rows.reduce((sum, row) => sum + Number(row.percentage || 0), 0);
+  const gstAmount = (Number(subtotal || 0) * gstPercentage) / 100;
+  return { selectedTaxIds: selected, gstPercentage, gstAmount };
+};
+
 const withTenantTx = async (tenantPool, fn) => {
   const client = await tenantPool.connect();
   try {
@@ -75,11 +118,13 @@ const ensurePendingRequestForUpdate = async (client, id) => {
 };
 
 const createPurchaseRequest = async (req, res) => {
-  const { supplier_id, remarks, items } = req.body || {};
+  const { supplier_id, remarks, items, gst_percentage, selected_tax_ids } = req.body || {};
 
   let supplierId;
+  let gstPercentage = 0;
   try {
     supplierId = ensureUuid(supplier_id, "supplier_id");
+    gstPercentage = toNonNegativeNumber(gst_percentage ?? 0, "gst_percentage");
   } catch (e) {
     return res.status(e.statusCode || 400).json({ message: e.message });
   }
@@ -125,7 +170,7 @@ const createPurchaseRequest = async (req, res) => {
       const rawIds = normalized.map((x) => x.raw_material_id);
       const rm = await client.query(
         `
-        SELECT id, name, purchase_unit_id
+        SELECT id, name, purchase_unit_id, purchase_price
         FROM raw_materials
         WHERE id = ANY($1::uuid[])
         `,
@@ -159,6 +204,25 @@ const createPurchaseRequest = async (req, res) => {
       }
 
       const requestNumber = await nextRequestNumber(client);
+      const purchaseTotal = normalized.reduce((sum, it) => {
+        const material = byId.get(it.raw_material_id);
+        const unitPrice = Number(material?.purchase_price || 0);
+        return sum + Number(it.quantity || 0) * unitPrice;
+      }, 0);
+      let computedSelectedTaxIds = normalizeTaxIds(selected_tax_ids);
+      let computedGstPercentage = Number(gstPercentage || 0);
+      let gstAmount = (purchaseTotal * computedGstPercentage) / 100;
+
+      if (computedSelectedTaxIds.length) {
+        const fromSelection = await computePurchaseTaxesFromSelection(
+          client,
+          purchaseTotal,
+          computedSelectedTaxIds
+        );
+        computedSelectedTaxIds = fromSelection.selectedTaxIds;
+        computedGstPercentage = fromSelection.gstPercentage;
+        gstAmount = fromSelection.gstAmount;
+      }
 
       const requestId = randomUUID();
       const createdBy = req.user?.id ? String(req.user.id).trim() : null;
@@ -167,12 +231,24 @@ const createPurchaseRequest = async (req, res) => {
       const inserted = await client.query(
         `
         INSERT INTO purchase_requests (
-          id, supplier_id, request_number, status, remarks, created_by
+          id, supplier_id, request_number, status, remarks, created_by,
+          purchase_total, gst_percentage, gst_amount, selected_tax_ids
         )
-        VALUES ($1, $2, $3, 'pending', $4, $5)
-        RETURNING id, supplier_id, request_number, status, remarks, created_by, created_at, updated_at
+        VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9::jsonb)
+        RETURNING id, supplier_id, request_number, status, remarks, created_by,
+                  purchase_total, gst_percentage, gst_amount, selected_tax_ids, created_at, updated_at
         `,
-        [requestId, supplierId, requestNumber, remarksText || null, createdBy]
+        [
+          requestId,
+          supplierId,
+          requestNumber,
+          remarksText || null,
+          createdBy,
+          purchaseTotal,
+          computedGstPercentage,
+          gstAmount,
+          JSON.stringify(computedSelectedTaxIds),
+        ]
       );
 
       for (const it of normalized) {
@@ -262,6 +338,10 @@ const listPurchaseRequests = async (req, res) => {
         pr.status,
         pr.is_po_created,
         pr.remarks,
+        pr.purchase_total,
+        pr.gst_percentage,
+        pr.gst_amount,
+        pr.selected_tax_ids,
         pr.created_at,
         pr.updated_at,
         pr.supplier_id,
@@ -360,6 +440,10 @@ const getPurchaseRequest = async (req, res) => {
         pr.request_number,
         pr.status,
         pr.remarks,
+        pr.purchase_total,
+        pr.gst_percentage,
+        pr.gst_amount,
+        pr.selected_tax_ids,
         pr.created_by,
         pr.created_at,
         pr.updated_at,

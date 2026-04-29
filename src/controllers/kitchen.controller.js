@@ -2,8 +2,29 @@ const { logError } = require("../utils/logError");
 
 const kitchenStatuses = ["kot_sent", "preparing", "ready", "served"];
 
+const startOfRange = (range) => {
+  const r = String(range || "day").trim().toLowerCase();
+  const now = new Date();
+  if (r === "month") return new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+  if (r === "week") {
+    const day = now.getDay(); // 0=Sun ... 6=Sat
+    const diff = day === 0 ? 6 : day - 1;
+    const d = new Date(now);
+    d.setDate(now.getDate() - diff);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+  const d = new Date(now);
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+
 const listKitchenOrders = async (req, res) => {
   try {
+    const range = String(req.query?.range || "day").trim().toLowerCase();
+    const allowedRanges = new Set(["day", "week", "month"]);
+    const rangeStart = startOfRange(allowedRanges.has(range) ? range : "day");
+
     const ordersQ = await req.tenantDB.query(
       `
       SELECT
@@ -19,9 +40,10 @@ const listKitchenOrders = async (req, res) => {
       FROM orders o
       LEFT JOIN tables t ON t.id = o.table_id
       WHERE o.status = ANY($1::text[])
+        AND o.created_at >= $2
       ORDER BY o.kot_sent_at ASC NULLS LAST, o.created_at ASC
       `,
-      [kitchenStatuses]
+      [kitchenStatuses, rangeStart]
     );
 
     const orders = ordersQ.rows || [];
@@ -36,11 +58,15 @@ const listKitchenOrders = async (req, res) => {
         oi.variant_id,
         i.name AS item_name,
         v.name AS variant_name,
-        oi.quantity
+        oi.quantity,
+        oi.status,
+        oi.is_voided
       FROM order_items oi
       JOIN menu_item_variants v ON v.id = oi.variant_id
       JOIN menu_items i ON i.id = v.item_id
       WHERE oi.order_id = ANY($1::uuid[])
+        AND COALESCE(oi.status, 'active') IN ('active', 'replaced')
+        AND COALESCE(oi.is_voided, FALSE) = FALSE
       ORDER BY oi.order_id ASC, i.name ASC, v.name ASC
       `,
       [orderIds]
@@ -113,6 +139,8 @@ const listKitchenOrders = async (req, res) => {
         item_name: it.item_name,
         variant_name: it.variant_name,
         quantity: it.quantity,
+        status: it.status,
+        is_voided: it.is_voided,
         recipe: materialsByVariant.get(it.variant_id) || [],
         steps: stepsByVariant.get(it.variant_id) || [],
       });
