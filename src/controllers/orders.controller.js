@@ -67,6 +67,7 @@ const normalizeItems = (items) => {
     return {
       variant_id: variantId,
       quantity: toPositiveNumber(it?.quantity, `items[${idx}].quantity`),
+      is_complimentary: Boolean(it?.is_complimentary),
     };
   });
 };
@@ -157,6 +158,7 @@ const recalcOrderTotalsForNonVoidedItems = async (client, orderId, { taxPercenta
     WHERE order_id = $1
       AND COALESCE(status, 'active') IN ('active', 'replaced')
       AND COALESCE(is_voided, FALSE) = FALSE
+      AND COALESCE(is_complimentary, FALSE) = FALSE
     `,
     [orderId]
   );
@@ -293,9 +295,9 @@ const createOrder = async (req, res) => {
       let subtotal = 0;
       const prepared = normalized.map((it) => {
         const price = Number(prices.get(it.variant_id) || 0);
-        const total_price = price * Number(it.quantity);
-        subtotal += total_price;
-        return { ...it, price, total_price };
+        const billableTotalPrice = it.is_complimentary ? 0 : price * Number(it.quantity);
+        subtotal += billableTotalPrice;
+        return { ...it, price, total_price: billableTotalPrice };
       });
 
       let taxAmount = 0;
@@ -356,11 +358,11 @@ const createOrder = async (req, res) => {
         await client.query(
           `
           INSERT INTO order_items (
-            id, order_id, variant_id, quantity, price, total_price, cost_price, profit
+            id, order_id, variant_id, quantity, price, total_price, cost_price, profit, is_complimentary
           )
-          VALUES ($1, $2, $3, $4, $5, $6, 0, 0)
+          VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7)
           `,
-          [randomUUID(), orderId, it.variant_id, it.quantity, it.price, it.total_price]
+          [randomUUID(), orderId, it.variant_id, it.quantity, it.price, it.total_price, Boolean(it.is_complimentary)]
         );
       }
 
@@ -452,16 +454,16 @@ const updateOrder = async (req, res) => {
         await client.query("DELETE FROM order_items WHERE order_id = $1", [id]);
         for (const it of normalized) {
           const price = Number(prices.get(it.variant_id) || 0);
-          const totalPrice = price * Number(it.quantity);
+          const totalPrice = it.is_complimentary ? 0 : price * Number(it.quantity);
 
           await client.query(
             `
             INSERT INTO order_items (
-              id, order_id, variant_id, quantity, price, total_price, cost_price, profit
+              id, order_id, variant_id, quantity, price, total_price, cost_price, profit, is_complimentary
             )
-            VALUES ($1, $2, $3, $4, $5, $6, 0, 0)
+            VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7)
             `,
-            [randomUUID(), id, it.variant_id, it.quantity, price, totalPrice]
+            [randomUUID(), id, it.variant_id, it.quantity, price, totalPrice, Boolean(it.is_complimentary)]
           );
         }
       }
@@ -469,7 +471,7 @@ const updateOrder = async (req, res) => {
       // Always recompute subtotal from DB (source of truth)
       const dbItems = await client.query(
         `
-        SELECT id, variant_id, quantity, price, total_price
+        SELECT id, variant_id, quantity, price, total_price, is_complimentary
         FROM order_items
         WHERE order_id = $1
         `,
@@ -481,6 +483,7 @@ const updateOrder = async (req, res) => {
         throw err;
       }
       for (const it of dbItems.rows || []) {
+        if (Boolean(it.is_complimentary)) continue;
         subtotal += Number(it.total_price || Number(it.price || 0) * Number(it.quantity || 0));
       }
 
@@ -802,7 +805,7 @@ const voidOrderItem = async (req, res) => {
       }
 
       const it = await client.query(
-        "SELECT id, quantity, total_price, cost_price, is_voided, status FROM order_items WHERE id = $1 AND order_id = $2 LIMIT 1 FOR UPDATE",
+        "SELECT id, quantity, total_price, cost_price, is_voided, status, is_complimentary FROM order_items WHERE id = $1 AND order_id = $2 LIMIT 1 FOR UPDATE",
         [itemId, id]
       );
       if (it.rowCount === 0) {
@@ -922,7 +925,7 @@ const replaceOrderItem = async (req, res) => {
       }
 
       const it = await client.query(
-        "SELECT id, variant_id, quantity, total_price, is_voided, status FROM order_items WHERE id = $1 AND order_id = $2 LIMIT 1 FOR UPDATE",
+        "SELECT id, variant_id, quantity, total_price, is_voided, status, is_complimentary FROM order_items WHERE id = $1 AND order_id = $2 LIMIT 1 FOR UPDATE",
         [itemId, id]
       );
       if (it.rowCount === 0) {
@@ -949,16 +952,17 @@ const replaceOrderItem = async (req, res) => {
         throw err;
       }
       const newPrice = Number(prices.get(newVariantId) || 0);
-      const newTotalPrice = newPrice * qty;
+      const isComplimentary = Boolean(it.rows[0]?.is_complimentary);
+      const newTotalPrice = isComplimentary ? 0 : newPrice * qty;
 
-      // Add new chargeable replacement item
+      // Add replacement item; keep complimentary flag from original item.
       const newItemId = randomUUID();
       await client.query(
         `
-        INSERT INTO order_items (id, order_id, variant_id, quantity, price, total_price, cost_price, profit, is_voided, status)
-        VALUES ($1, $2, $3, $4, $5, $6, 0, 0, FALSE, 'replaced')
+        INSERT INTO order_items (id, order_id, variant_id, quantity, price, total_price, cost_price, profit, is_voided, status, is_complimentary)
+        VALUES ($1, $2, $3, $4, $5, $6, 0, 0, FALSE, 'replaced', $7)
         `,
-        [newItemId, id, newVariantId, qty, newPrice, newTotalPrice]
+        [newItemId, id, newVariantId, qty, newPrice, newTotalPrice, isComplimentary]
       );
 
       // Deduct stock again + snapshot consumption + compute replacement cost
@@ -1184,22 +1188,31 @@ const correctOrder = async (req, res) => {
       const insertedItems = [];
       for (const it of normalized) {
         const price = Number(prices.get(it.variant_id) || 0);
-        const totalPrice = price * Number(it.quantity);
+        const totalPrice = it.is_complimentary ? 0 : price * Number(it.quantity);
         const itemId = randomUUID();
         await client.query(
           `
           INSERT INTO order_items (
-            id, order_id, variant_id, quantity, price, total_price, cost_price, profit
+            id, order_id, variant_id, quantity, price, total_price, cost_price, profit, is_complimentary
           )
-          VALUES ($1, $2, $3, $4, $5, $6, 0, 0)
+          VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7)
           `,
-          [itemId, id, it.variant_id, it.quantity, price, totalPrice]
+          [itemId, id, it.variant_id, it.quantity, price, totalPrice, Boolean(it.is_complimentary)]
         );
-        insertedItems.push({ id: itemId, variant_id: it.variant_id, quantity: it.quantity, total_price: totalPrice });
+        insertedItems.push({
+          id: itemId,
+          variant_id: it.variant_id,
+          quantity: it.quantity,
+          total_price: totalPrice,
+          is_complimentary: Boolean(it.is_complimentary),
+        });
       }
 
       // Recalculate billing from new items
-      const subtotal = insertedItems.reduce((s, it) => s + Number(it.total_price || 0), 0);
+      const subtotal = insertedItems.reduce((s, it) => {
+        if (Boolean(it.is_complimentary)) return s;
+        return s + Number(it.total_price || 0);
+      }, 0);
       let taxPercentage = Number(o.tax_percentage || 0);
       let selectedTaxIds = normalizeTaxIds(o.selected_tax_ids);
       let taxBreakup = {};
@@ -1619,7 +1632,8 @@ const listLiveOrders = async (req, res) => {
         oi.quantity,
         oi.status,
         oi.is_voided,
-        oi.voided_at
+        oi.voided_at,
+        oi.is_complimentary
       FROM order_items oi
       JOIN menu_item_variants v ON v.id = oi.variant_id
       JOIN menu_items i ON i.id = v.item_id
@@ -1639,6 +1653,7 @@ const listLiveOrders = async (req, res) => {
         status: it.status,
         is_voided: it.is_voided,
         voided_at: it.voided_at,
+        is_complimentary: it.is_complimentary,
       });
       itemsByOrder.set(it.order_id, arr);
     }
@@ -1723,7 +1738,8 @@ const getOrder = async (req, res) => {
         oi.status,
         oi.is_voided,
         oi.void_reason,
-        oi.voided_at
+        oi.voided_at,
+        oi.is_complimentary
       FROM order_items oi
       JOIN menu_item_variants v ON v.id = oi.variant_id
       JOIN menu_items i ON i.id = v.item_id
@@ -1816,6 +1832,7 @@ const getActiveOrderByTable = async (req, res) => {
         oi.variant_id,
         oi.quantity,
         oi.price,
+        oi.is_complimentary,
         i.name AS item_name,
         v.name AS variant_name
       FROM order_items oi
@@ -1903,7 +1920,7 @@ const updateOrderStatus = async (req, res) => {
       // Served finalization logic (execute once, inside same tx)
       const items = await client.query(
         `
-        SELECT id, variant_id, quantity, price, total_price
+        SELECT id, variant_id, quantity, price, total_price, is_complimentary
         FROM order_items
         WHERE order_id = $1
           AND COALESCE(status, 'active') = 'active'
@@ -1922,7 +1939,9 @@ const updateOrderStatus = async (req, res) => {
       for (const it of items.rows) {
         const qty = Number(it.quantity);
         const totalPrice = Number(it.total_price);
-        subtotal += totalPrice;
+        if (!Boolean(it.is_complimentary)) {
+          subtotal += totalPrice;
+        }
 
         // Fetch recipe ingredients with raw material pricing/config
         const recipe = await client.query(

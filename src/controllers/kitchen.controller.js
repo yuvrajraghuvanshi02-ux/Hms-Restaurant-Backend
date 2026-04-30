@@ -60,7 +60,8 @@ const listKitchenOrders = async (req, res) => {
         v.name AS variant_name,
         oi.quantity,
         oi.status,
-        oi.is_voided
+        oi.is_voided,
+        oi.is_complimentary
       FROM order_items oi
       JOIN menu_item_variants v ON v.id = oi.variant_id
       JOIN menu_items i ON i.id = v.item_id
@@ -141,6 +142,7 @@ const listKitchenOrders = async (req, res) => {
         quantity: it.quantity,
         status: it.status,
         is_voided: it.is_voided,
+        is_complimentary: it.is_complimentary,
         recipe: materialsByVariant.get(it.variant_id) || [],
         steps: stepsByVariant.get(it.variant_id) || [],
       });
