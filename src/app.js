@@ -21,6 +21,7 @@ const paymentsRoutes = require("./routes/payments.routes");
 const reportsRoutes = require("./routes/reports.routes");
 const taxesRoutes = require("./routes/taxes.routes");
 const auditRoutes = require("./routes/audit.routes");
+const publicRoutes = require("./routes/public.routes");
 const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
@@ -56,6 +57,7 @@ app.use("/api/payments", paymentsRoutes);
 app.use("/api/reports", reportsRoutes);
 app.use("/api/taxes", taxesRoutes);
 app.use("/api/audit", auditRoutes);
+app.use("/api/public", publicRoutes);
 app.use(errorHandler);
 
 module.exports = app;

@@ -45,28 +45,48 @@ const getDayEndAudit = async (req, res) => {
 
     const financialsQ = await req.tenantDB.query(
       `
-      SELECT
-        COALESCE(SUM(oi.total_price), 0)::numeric AS subtotal_total,
-        COALESCE(
-          SUM(
+      WITH filtered_orders AS (
+        SELECT
+          o.id,
+          COALESCE(
             CASE
               WHEN o.total_tax_amount IS NOT NULL THEN o.total_tax_amount
               ELSE o.tax_amount
-            END
-          ),
-          0
-        )::numeric AS total_tax_collected,
-        COALESCE(SUM(o.discount_amount), 0)::numeric AS total_discount,
-        COALESCE(SUM(o.tip_amount), 0)::numeric AS total_tip,
-        COALESCE(SUM(p.paid_amount), 0)::numeric AS final_collection
-      FROM orders o
-      LEFT JOIN payments p ON p.order_id = o.id
-      LEFT JOIN order_items oi ON oi.order_id = o.id
-        AND COALESCE(oi.status, 'active') IN ('active', 'replaced')
-        AND COALESCE(oi.is_voided, FALSE) = FALSE
-        AND COALESCE(oi.is_complimentary, FALSE) = FALSE
-      WHERE DATE(o.created_at) = $1::date
-        AND LOWER(COALESCE(o.status, '')) = 'completed'
+            END,
+            0
+          )::numeric AS order_tax_amount,
+          COALESCE(o.discount_amount, 0)::numeric AS discount_amount,
+          COALESCE(o.tip_amount, 0)::numeric AS tip_amount
+        FROM orders o
+        WHERE DATE(o.created_at) = $1::date
+          AND LOWER(COALESCE(o.status, '')) = 'completed'
+      ),
+      item_subtotals AS (
+        SELECT
+          oi.order_id,
+          COALESCE(SUM(oi.total_price), 0)::numeric AS subtotal
+        FROM order_items oi
+        JOIN filtered_orders fo ON fo.id = oi.order_id
+        WHERE COALESCE(oi.status, 'active') IN ('active', 'replaced')
+          AND COALESCE(oi.is_voided, FALSE) = FALSE
+          AND COALESCE(oi.is_complimentary, FALSE) = FALSE
+        GROUP BY oi.order_id
+      ),
+      payment_totals AS (
+        SELECT
+          p.order_id,
+          COALESCE(SUM(p.paid_amount), 0)::numeric AS paid_amount
+        FROM payments p
+        JOIN filtered_orders fo ON fo.id = p.order_id
+        GROUP BY p.order_id
+      )
+      SELECT
+        COALESCE((SELECT SUM(s.subtotal) FROM item_subtotals s), 0)::numeric AS subtotal_total,
+        COALESCE(SUM(fo.order_tax_amount), 0)::numeric AS total_tax_collected,
+        COALESCE(SUM(fo.discount_amount), 0)::numeric AS total_discount,
+        COALESCE(SUM(fo.tip_amount), 0)::numeric AS total_tip,
+        COALESCE((SELECT SUM(pt.paid_amount) FROM payment_totals pt), 0)::numeric AS final_collection
+      FROM filtered_orders fo
       `,
       [date]
     );
