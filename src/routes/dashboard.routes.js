@@ -2,15 +2,13 @@ const express = require("express");
 const { requireAuth } = require("../middleware/auth");
 const { attachTenantDb } = require("../middleware/tenant");
 const { requireTenantAdmin } = require("../middleware/requireTenantAdmin");
-const { checkPermission } = require("../middleware/permissions");
-const { createPayment, getPaymentByOrder } = require("../controllers/payments.controller");
+const { checkAnyPermission } = require("../middleware/permissions");
+const { getDashboard } = require("../controllers/dashboard.controller");
 
 const router = express.Router();
 
 router.use(requireAuth, attachTenantDb, requireTenantAdmin);
-
-router.post("/", checkPermission("orders", "add"), createPayment);
-router.get("/:order_id", checkPermission("orders", "view"), getPaymentByOrder);
+router.get("/", checkAnyPermission(["audit", "orders", "live_orders"], "view"), getDashboard);
 
 module.exports = router;
 

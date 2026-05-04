@@ -127,6 +127,163 @@ const listDiscountsReport = async (req, res) => {
   }
 };
 
+const listStaffReport = async (req, res) => {
+  try {
+    const params = parseListParams(req.query, { defaultSortBy: "name", defaultOrder: "ASC" });
+    const search = String(params.search || "").trim();
+
+    const whereParts = [];
+    const args = [];
+    if (search) {
+      args.push(`%${search}%`);
+      whereParts.push(`(s.name ILIKE $${args.length} OR s.email ILIKE $${args.length} OR s.phone ILIKE $${args.length})`);
+    }
+    const where = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
+
+    const totalQ = await req.tenantDB.query(
+      `
+      SELECT COUNT(*)::int AS total
+      FROM staff_users s
+      ${where}
+      `,
+      args
+    );
+    const total = totalQ.rows[0]?.total ?? 0;
+
+    const dataArgs = [...args, params.limit, params.offset];
+    const limitIdx = dataArgs.length - 1;
+    const offsetIdx = dataArgs.length;
+    const q = await req.tenantDB.query(
+      `
+      SELECT
+        s.id,
+        s.name,
+        s.email,
+        s.phone,
+        s.is_active,
+        COALESCE(agg.orders_count, 0)::int AS orders_count,
+        COALESCE(agg.completed_orders_count, 0)::int AS completed_orders_count,
+        COALESCE(agg.total_tip, 0)::numeric AS total_tip
+      FROM staff_users s
+      LEFT JOIN (
+        SELECT
+          o.assigned_staff_id,
+          COUNT(*) AS orders_count,
+          COUNT(*) FILTER (WHERE LOWER(COALESCE(o.status, '')) = 'completed') AS completed_orders_count,
+          COALESCE(SUM(o.tip_amount), 0)::numeric AS total_tip
+        FROM orders o
+        WHERE o.assigned_staff_id IS NOT NULL
+        GROUP BY o.assigned_staff_id
+      ) agg ON agg.assigned_staff_id = s.id
+      ${where}
+      ORDER BY s.name ASC
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
+      `,
+      dataArgs
+    );
+
+    return res.status(200).json({
+      staff: q.rows || [],
+      pagination: buildPagination({ total, page: params.page, limit: params.limit }),
+    });
+  } catch (error) {
+    logError("GET /api/reports/staff", error);
+    return res.status(500).json({ message: "Failed to fetch staff report." });
+  }
+};
+
+const listStaffOrdersReport = async (req, res) => {
+  const staffId = String(req.params?.staff_id || "").trim();
+  if (!staffId) return res.status(400).json({ message: "staff_id is required." });
+
+  try {
+    const params = parseListParams(req.query, { defaultSortBy: "created_at", defaultOrder: "DESC" });
+    const range = String(req.query?.range || "month").trim().toLowerCase();
+    const allowedRanges = new Set(["day", "week", "month", "all"]);
+    const finalRange = allowedRanges.has(range) ? range : "month";
+
+    const staffQ = await req.tenantDB.query(
+      `
+      SELECT id, name, email, phone, is_active
+      FROM staff_users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [staffId]
+    );
+    if (staffQ.rowCount === 0) return res.status(404).json({ message: "Staff not found." });
+
+    const whereParts = ["o.assigned_staff_id = $1"];
+    const args = [staffId];
+    if (finalRange !== "all") {
+      args.push(startOfRange(finalRange));
+      whereParts.push(`o.created_at >= $${args.length}`);
+    }
+    if (params.search) {
+      args.push(`%${params.search}%`);
+      whereParts.push(`(o.order_number ILIKE $${args.length} OR t.name ILIKE $${args.length})`);
+    }
+    const where = `WHERE ${whereParts.join(" AND ")}`;
+
+    const summaryQ = await req.tenantDB.query(
+      `
+      SELECT
+        COUNT(*)::int AS total_orders,
+        COALESCE(SUM(o.total_amount), 0)::numeric AS total_amount,
+        COALESCE(SUM(o.tip_amount), 0)::numeric AS total_tip
+      FROM orders o
+      LEFT JOIN tables t ON t.id = o.table_id
+      ${where}
+      `,
+      args
+    );
+
+    const total = Number(summaryQ.rows[0]?.total_orders || 0);
+    const totalAmount = Number(summaryQ.rows[0]?.total_amount || 0);
+    const totalTip = Number(summaryQ.rows[0]?.total_tip || 0);
+
+    const dataArgs = [...args, params.limit, params.offset];
+    const limitIdx = dataArgs.length - 1;
+    const offsetIdx = dataArgs.length;
+    const ordersQ = await req.tenantDB.query(
+      `
+      SELECT
+        o.id AS order_id,
+        o.order_number,
+        o.order_type,
+        o.status,
+        o.payment_status,
+        o.created_at,
+        o.completed_at,
+        o.guest_name,
+        t.name AS table_name,
+        o.total_amount,
+        o.tip_amount
+      FROM orders o
+      LEFT JOIN tables t ON t.id = o.table_id
+      ${where}
+      ORDER BY o.created_at DESC
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
+      `,
+      dataArgs
+    );
+
+    return res.status(200).json({
+      staff: staffQ.rows[0],
+      summary: {
+        total_orders: total,
+        total_amount: totalAmount,
+        total_tip: totalTip,
+      },
+      orders: ordersQ.rows || [],
+      pagination: buildPagination({ total, page: params.page, limit: params.limit }),
+    });
+  } catch (error) {
+    logError("GET /api/reports/staff/:staff_id/orders", error);
+    return res.status(500).json({ message: "Failed to fetch staff orders report." });
+  }
+};
+
 const getGstSummaryReport = async (req, res) => {
   try {
     const range = String(req.query?.range || "month").trim().toLowerCase();
@@ -180,5 +337,11 @@ const getGstSummaryReport = async (req, res) => {
   }
 };
 
-module.exports = { listTipsReport, listDiscountsReport, getGstSummaryReport };
+module.exports = {
+  listTipsReport,
+  listDiscountsReport,
+  listStaffReport,
+  listStaffOrdersReport,
+  getGstSummaryReport,
+};
 

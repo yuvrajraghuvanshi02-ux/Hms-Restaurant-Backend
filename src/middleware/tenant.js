@@ -10,7 +10,7 @@ const attachTenantDb = async (req, res, next) => {
       return next();
     }
 
-    if (role === "admin") {
+    if (role === "admin" || role === "staff") {
       const restaurantId = req.user?.restaurant_id;
       if (!restaurantId) {
         return res.status(400).json({ message: "restaurant_id missing in token." });

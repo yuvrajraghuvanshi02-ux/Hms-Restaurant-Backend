@@ -19,9 +19,11 @@ const ordersRoutes = require("./routes/orders.routes");
 const kitchenRoutes = require("./routes/kitchen.routes");
 const paymentsRoutes = require("./routes/payments.routes");
 const reportsRoutes = require("./routes/reports.routes");
+const dashboardRoutes = require("./routes/dashboard.routes");
 const taxesRoutes = require("./routes/taxes.routes");
 const auditRoutes = require("./routes/audit.routes");
 const publicRoutes = require("./routes/public.routes");
+const staffRoutes = require("./routes/staff.routes");
 const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
@@ -55,9 +57,11 @@ app.use("/api/orders", ordersRoutes);
 app.use("/api/kitchen", kitchenRoutes);
 app.use("/api/payments", paymentsRoutes);
 app.use("/api/reports", reportsRoutes);
+app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/taxes", taxesRoutes);
 app.use("/api/audit", auditRoutes);
 app.use("/api/public", publicRoutes);
+app.use("/api/staff", staffRoutes);
 app.use(errorHandler);
 
 module.exports = app;

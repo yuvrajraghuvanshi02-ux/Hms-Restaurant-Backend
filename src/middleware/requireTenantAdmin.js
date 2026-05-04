@@ -1,5 +1,6 @@
 const requireTenantAdmin = (req, res, next) => {
-  if (req.user?.role !== "admin") {
+  const role = String(req.user?.role || "").toLowerCase();
+  if (role !== "admin" && role !== "staff") {
     return res.status(403).json({ message: "Forbidden." });
   }
   if (!req.tenantDB) {

@@ -50,6 +50,29 @@ const ensureTableExists = async (client, tableId) => {
   return t.rowCount > 0;
 };
 
+const ensureAssignedStaffValid = async (client, assignedStaffId) => {
+  if (assignedStaffId === undefined || assignedStaffId === null || String(assignedStaffId).trim() === "") {
+    return null;
+  }
+  const staffId = String(assignedStaffId).trim();
+  const q = await client.query(
+    `
+    SELECT id
+    FROM staff_users
+    WHERE id = $1
+      AND is_active = TRUE
+    LIMIT 1
+    `,
+    [staffId]
+  );
+  if (q.rowCount === 0) {
+    const err = new Error("Assigned staff is invalid or inactive.");
+    err.statusCode = 400;
+    throw err;
+  }
+  return staffId;
+};
+
 const normalizeItems = (items) => {
   const rows = Array.isArray(items) ? items : [];
   if (rows.length === 0) {
@@ -244,7 +267,7 @@ const startOfRange = (range) => {
 };
 
 const createOrder = async (req, res) => {
-  const { order_type, table_id, items, guest_name, guest_phone, guest_address, tax_percentage, selected_tax_ids } = req.body || {};
+  const { order_type, table_id, items, guest_name, guest_phone, guest_address, tax_percentage, selected_tax_ids, assigned_staff_id } = req.body || {};
   const orderType = String(order_type || "dine_in").trim().toLowerCase();
   const allowedTypes = new Set(["dine_in", "takeaway", "delivery"]);
   if (!allowedTypes.has(orderType)) return res.status(400).json({ message: "Invalid order_type." });
@@ -263,6 +286,7 @@ const createOrder = async (req, res) => {
       const guestName = toNullableText(guest_name, 160);
       const guestPhone = toNullableText(guest_phone, 40);
       const guestAddress = toNullableText(guest_address);
+      const assignedStaffId = await ensureAssignedStaffValid(client, assigned_staff_id);
 
       const tableId = table_id ? String(table_id).trim() : null;
       if (orderType === "dine_in") {
@@ -324,14 +348,14 @@ const createOrder = async (req, res) => {
         `
         INSERT INTO orders (
           id, order_number, order_type, status, table_id,
-          guest_name, guest_phone, guest_address,
+          guest_name, guest_phone, guest_address, assigned_staff_id,
           tax_percentage, tax_amount, total_amount, selected_tax_ids, tax_breakup, total_tax_amount,
           kot_sent_at
         )
-        VALUES ($1, $2, $3, 'kot_sent', $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, NOW())
+        VALUES ($1, $2, $3, 'kot_sent', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, NOW())
         RETURNING
           id, order_number, order_type, status, table_id,
-          guest_name, guest_phone, guest_address,
+          guest_name, guest_phone, guest_address, assigned_staff_id,
           tax_percentage, tax_amount, selected_tax_ids, tax_breakup, total_tax_amount,
           total_amount, total_cost, total_profit,
           kot_sent_at,
@@ -345,6 +369,7 @@ const createOrder = async (req, res) => {
           guestName,
           guestPhone,
           guestAddress,
+          assignedStaffId,
           taxPercentage,
           taxAmount,
           total,
@@ -381,9 +406,13 @@ const createOrder = async (req, res) => {
 
 const updateOrder = async (req, res) => {
   const { id } = req.params;
-  const { table_id, items, guest_name, guest_phone, guest_address, tax_percentage, selected_tax_ids } = req.body || {};
+  const { table_id, items, guest_name, guest_phone, guest_address, tax_percentage, selected_tax_ids, assigned_staff_id } = req.body || {};
 
   const hasItems = Array.isArray(items);
+  const hasAssignedStaffField = Object.prototype.hasOwnProperty.call(req.body || {}, "assigned_staff_id");
+  const hasTaxField =
+    Object.prototype.hasOwnProperty.call(req.body || {}, "tax_percentage") ||
+    Object.prototype.hasOwnProperty.call(req.body || {}, "selected_tax_ids");
   let normalized = null;
   if (hasItems) {
     try {
@@ -396,7 +425,22 @@ const updateOrder = async (req, res) => {
   try {
     const updated = await withTenantTx(req.tenantDB, async (client) => {
       const ord = await client.query(
-        "SELECT id, order_type, status, table_id, tax_percentage, selected_tax_ids, discount_amount FROM orders WHERE id = $1 LIMIT 1 FOR UPDATE",
+        `SELECT
+          id,
+          order_type,
+          status,
+          table_id,
+          guest_name,
+          guest_phone,
+          guest_address,
+          assigned_staff_id,
+          tax_percentage,
+          selected_tax_ids,
+          discount_amount
+        FROM orders
+        WHERE id = $1
+        LIMIT 1
+        FOR UPDATE`,
         [id]
       );
       if (ord.rowCount === 0) {
@@ -405,7 +449,12 @@ const updateOrder = async (req, res) => {
         throw err;
       }
       const status = String(ord.rows[0].status || "").toLowerCase();
-      if (status === "served" || status === "completed" || status === "cancelled") {
+      if (status === "completed" || status === "cancelled") {
+        const err = new Error("Order cannot be edited after served");
+        err.statusCode = 400;
+        throw err;
+      }
+      if (status === "served" && (hasItems || table_id !== undefined || hasTaxField)) {
         const err = new Error("Order cannot be edited after served");
         err.statusCode = 400;
         throw err;
@@ -433,9 +482,12 @@ const updateOrder = async (req, res) => {
       const selectedTaxIds = selected_tax_ids !== undefined
         ? normalizeTaxIds(selected_tax_ids)
         : normalizeTaxIds(ord.rows[0]?.selected_tax_ids);
-      const guestName = toNullableText(guest_name, 160);
-      const guestPhone = toNullableText(guest_phone, 40);
-      const guestAddress = toNullableText(guest_address);
+      const guestName = guest_name === undefined ? ord.rows[0]?.guest_name || null : toNullableText(guest_name, 160);
+      const guestPhone = guest_phone === undefined ? ord.rows[0]?.guest_phone || null : toNullableText(guest_phone, 40);
+      const guestAddress = guest_address === undefined ? ord.rows[0]?.guest_address || null : toNullableText(guest_address);
+      const assignedStaffId = hasAssignedStaffField
+        ? await ensureAssignedStaffValid(client, assigned_staff_id)
+        : ord.rows[0]?.assigned_staff_id || null;
 
       let subtotal = 0;
 
@@ -598,19 +650,20 @@ const updateOrder = async (req, res) => {
             guest_name = $2,
             guest_phone = $3,
             guest_address = $4,
-            tax_percentage = $5,
-            tax_amount = $6,
-            total_amount = $7,
-            selected_tax_ids = $8::jsonb,
-            tax_breakup = $9::jsonb,
-            total_tax_amount = $10,
-            total_cost = $11,
-            total_profit = $12,
+            assigned_staff_id = $5,
+            tax_percentage = $6,
+            tax_amount = $7,
+            total_amount = $8,
+            selected_tax_ids = $9::jsonb,
+            tax_breakup = $10::jsonb,
+            total_tax_amount = $11,
+            total_cost = $12,
+            total_profit = $13,
             updated_at = NOW()
-        WHERE id = $13
+        WHERE id = $14
         RETURNING
           id, order_number, order_type, status, table_id,
-          guest_name, guest_phone, guest_address,
+          guest_name, guest_phone, guest_address, assigned_staff_id,
           tax_percentage, tax_amount, selected_tax_ids, tax_breakup, total_tax_amount,
           total_amount, total_cost, total_profit,
           created_at, updated_at
@@ -620,6 +673,7 @@ const updateOrder = async (req, res) => {
           guestName,
           guestPhone,
           guestAddress,
+          assignedStaffId,
           outTaxPercentage,
           taxAmount,
           total,
@@ -1442,6 +1496,10 @@ const listOrders = async (req, res) => {
         o.guest_name,
         o.guest_phone,
         o.guest_address,
+        o.assigned_staff_id,
+        su.name AS assigned_staff_name,
+        su.email AS assigned_staff_email,
+        su.phone AS assigned_staff_phone,
         o.tax_percentage,
         o.tax_amount,
         o.selected_tax_ids,
@@ -1458,6 +1516,7 @@ const listOrders = async (req, res) => {
       FROM orders o
       LEFT JOIN tables t ON t.id = o.table_id
       LEFT JOIN table_types tt ON tt.id = t.table_type_id
+      LEFT JOIN staff_users su ON su.id = o.assigned_staff_id
       ${where}
       ORDER BY o.${sortBy} ${order}
       LIMIT $${limitIdx} OFFSET $${offsetIdx}
@@ -1607,9 +1666,12 @@ const listLiveOrders = async (req, res) => {
         o.discount_amount,
         o.tip_amount,
         o.payment_status,
+        o.assigned_staff_id,
+        su.name AS assigned_staff_name,
         t.name AS table_name
       FROM orders o
       LEFT JOIN tables t ON t.id = o.table_id
+      LEFT JOIN staff_users su ON su.id = o.assigned_staff_id
       ${where}
       ORDER BY o.created_at DESC
       LIMIT $${limitIdx} OFFSET $${offsetIdx}
@@ -1670,6 +1732,8 @@ const listLiveOrders = async (req, res) => {
         discount_amount: o.discount_amount,
         tip_amount: o.tip_amount,
         payment_status: o.payment_status,
+        assigned_staff_id: o.assigned_staff_id,
+        assigned_staff_name: o.assigned_staff_name,
         table_name: o.table_name,
         items: itemsByOrder.get(o.order_id) || [],
       })),
@@ -1700,6 +1764,10 @@ const getOrder = async (req, res) => {
         o.guest_name,
         o.guest_phone,
         o.guest_address,
+        o.assigned_staff_id,
+        su.name AS assigned_staff_name,
+        su.email AS assigned_staff_email,
+        su.phone AS assigned_staff_phone,
         o.tax_percentage,
         o.tax_amount,
         o.selected_tax_ids,
@@ -1716,6 +1784,7 @@ const getOrder = async (req, res) => {
       FROM orders o
       LEFT JOIN tables t ON t.id = o.table_id
       LEFT JOIN table_types tt ON tt.id = t.table_type_id
+      LEFT JOIN staff_users su ON su.id = o.assigned_staff_id
       WHERE o.id = $1
       LIMIT 1
       `,
@@ -1806,6 +1875,8 @@ const getActiveOrderByTable = async (req, res) => {
         o.guest_name,
         o.guest_phone,
         o.guest_address,
+        o.assigned_staff_id,
+        su.name AS assigned_staff_name,
         o.tax_percentage,
         o.tax_amount,
         o.selected_tax_ids,
@@ -1815,6 +1886,7 @@ const getActiveOrderByTable = async (req, res) => {
         o.tip_amount,
         o.total_amount
       FROM orders o
+      LEFT JOIN staff_users su ON su.id = o.assigned_staff_id
       WHERE o.table_id = $1
         AND o.status NOT IN ('completed', 'cancelled')
       ORDER BY o.created_at DESC
