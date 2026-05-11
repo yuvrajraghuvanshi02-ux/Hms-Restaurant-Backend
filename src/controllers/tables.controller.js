@@ -3,6 +3,8 @@ const { logError } = require("../utils/logError");
 const { parseListParams, buildPagination, pickSort } = require("../utils/listQuery");
 
 const isUniqueViolation = (error) => error?.code === "23505";
+const RESTORED_MESSAGE = "This item already existed and has been restored";
+const DEACTIVATED_IN_USE_MESSAGE = "This item is in use and has been deactivated instead";
 
 const toCapacity = (value) => {
   const n = Number.parseInt(String(value ?? ""), 10);
@@ -32,6 +34,47 @@ const createTable = async (req, res) => {
     const type = await req.tenantDB.query("SELECT id FROM table_types WHERE id = $1 LIMIT 1", [typeId]);
     if (type.rowCount === 0) return res.status(400).json({ message: "Selected table type does not exist." });
 
+    const activeExisting = await req.tenantDB.query(
+      `
+      SELECT id
+      FROM tables
+      WHERE LOWER(BTRIM(name::text)) = LOWER(BTRIM($1::text))
+        AND COALESCE(is_active, TRUE) = TRUE
+      LIMIT 1
+      `,
+      [nm]
+    );
+    if (activeExisting.rowCount > 0) {
+      return res.status(409).json({ message: "Table name already exists." });
+    }
+
+    const inactiveExisting = await req.tenantDB.query(
+      `
+      SELECT id
+      FROM tables
+      WHERE LOWER(BTRIM(name::text)) = LOWER(BTRIM($1::text))
+        AND COALESCE(is_active, TRUE) = FALSE
+      LIMIT 1
+      `,
+      [nm]
+    );
+    if (inactiveExisting.rowCount > 0) {
+      const restored = await req.tenantDB.query(
+        `
+        UPDATE tables
+        SET name = $1,
+            table_type_id = $2,
+            capacity = $3,
+            is_active = TRUE,
+            updated_at = NOW()
+        WHERE id = $4
+        RETURNING id, name, table_type_id, capacity, is_active, created_at, updated_at
+        `,
+        [nm, typeId, cap, inactiveExisting.rows[0].id]
+      );
+      return res.status(200).json({ message: RESTORED_MESSAGE, data: restored.rows[0] });
+    }
+
     const inserted = await req.tenantDB.query(
       `
       INSERT INTO tables (id, name, table_type_id, capacity, is_active)
@@ -52,11 +95,18 @@ const listTables = async (req, res) => {
   try {
     const params = parseListParams(req.query, { defaultSortBy: "created_at", defaultOrder: "DESC" });
     const { sortBy, order } = pickSort(params, ["created_at", "name", "capacity"], "created_at");
-
-    const where = params.search
-      ? "WHERE (t.name ILIKE $1 OR tt.name ILIKE $1)"
-      : "";
-    const countArgs = params.search ? [`%${params.search}%`] : [];
+    const active = String(req.query?.active || "").trim().toLowerCase();
+    const whereParts = [];
+    const args = [];
+    if (params.search) {
+      args.push(`%${params.search}%`);
+      whereParts.push(`(t.name ILIKE $${args.length} OR tt.name ILIKE $${args.length})`);
+    }
+    if (active === "true" || active === "false") {
+      args.push(active === "true");
+      whereParts.push(`t.is_active = $${args.length}`);
+    }
+    const where = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
 
     const totalResult = await req.tenantDB.query(
       `
@@ -65,13 +115,13 @@ const listTables = async (req, res) => {
       JOIN table_types tt ON tt.id = t.table_type_id
       ${where}
       `,
-      countArgs
+      args
     );
     const total = totalResult.rows[0]?.total ?? 0;
 
-    const dataArgs = params.search
-      ? [`%${params.search}%`, params.limit, params.offset]
-      : [params.limit, params.offset];
+    const dataArgs = [...args, params.limit, params.offset];
+    const limitIdx = dataArgs.length - 1;
+    const offsetIdx = dataArgs.length;
 
     const result = await req.tenantDB.query(
       `
@@ -83,12 +133,18 @@ const listTables = async (req, res) => {
         t.created_at,
         t.updated_at,
         t.table_type_id,
-        tt.name AS table_type_name
+        tt.name AS table_type_name,
+        NOT EXISTS (
+          SELECT 1
+          FROM orders o2
+          WHERE o2.table_id = t.id
+          LIMIT 1
+        ) AS can_delete
       FROM tables t
       JOIN table_types tt ON tt.id = t.table_type_id
       ${where}
       ORDER BY t.${sortBy} ${order}
-      LIMIT $${params.search ? 2 : 1} OFFSET $${params.search ? 3 : 2}
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
       `,
       dataArgs
     );
@@ -181,6 +237,20 @@ const deleteTable = async (req, res) => {
     const existing = await req.tenantDB.query("SELECT id FROM tables WHERE id = $1 LIMIT 1", [id]);
     if (existing.rowCount === 0) return res.status(404).json({ message: "Table not found." });
 
+    const used = await req.tenantDB.query("SELECT 1 FROM orders WHERE table_id = $1 LIMIT 1", [id]);
+    if (used.rowCount > 0) {
+      await req.tenantDB.query(
+        `
+        UPDATE tables
+        SET is_active = FALSE,
+            updated_at = NOW()
+        WHERE id = $1
+        `,
+        [id]
+      );
+      return res.status(200).json({ message: DEACTIVATED_IN_USE_MESSAGE });
+    }
+
     await req.tenantDB.query("DELETE FROM tables WHERE id = $1", [id]);
     return res.status(200).json({ message: "Table deleted." });
   } catch (error) {
@@ -198,7 +268,9 @@ const listTablesWithStatus = async (req, res) => {
         t.name AS table_name,
         tt.name AS table_type,
         t.capacity,
+        t.is_active,
         CASE
+          WHEN COALESCE(t.is_active, TRUE) = FALSE THEN 'inactive'
           WHEN EXISTS (
             SELECT 1
             FROM orders o
@@ -210,7 +282,6 @@ const listTablesWithStatus = async (req, res) => {
         END AS status
       FROM tables t
       JOIN table_types tt ON tt.id = t.table_type_id
-      WHERE t.is_active = true
       ORDER BY tt.name ASC, t.name ASC
       `
     );

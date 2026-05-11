@@ -7,7 +7,9 @@ const {
   listRawMaterials,
   listUnits,
   updateRawMaterial,
+  updateRawMaterialStatus,
   updateUnit,
+  updateUnitStatus,
 } = require("../controllers/inventory.controller");
 const { requireAuth } = require("../middleware/auth");
 const { attachTenantDb } = require("../middleware/tenant");
@@ -21,11 +23,13 @@ router.use(requireAuth, attachTenantDb, requireTenantAdmin);
 router.post("/units", checkPermission("inventory", "add"), createUnit);
 router.get("/units", checkPermission("inventory", "view"), listUnits);
 router.put("/units/:id", checkPermission("inventory", "edit"), updateUnit);
+router.patch("/units/:id/status", checkPermission("inventory", "edit"), updateUnitStatus);
 router.delete("/units/:id", checkPermission("inventory", "delete"), deleteUnit);
 
 router.post("/raw-materials", checkPermission("inventory", "add"), createRawMaterial);
 router.get("/raw-materials", checkPermission("inventory", "view"), listRawMaterials);
 router.put("/raw-materials/:id", checkPermission("inventory", "edit"), updateRawMaterial);
+router.patch("/raw-materials/:id/status", checkPermission("inventory", "edit"), updateRawMaterialStatus);
 router.delete("/raw-materials/:id", checkPermission("inventory", "delete"), deleteRawMaterial);
 
 module.exports = router;

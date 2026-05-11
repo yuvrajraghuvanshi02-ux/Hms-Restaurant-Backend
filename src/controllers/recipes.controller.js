@@ -1,6 +1,7 @@
 const { randomUUID } = require("crypto");
 const { logError } = require("../utils/logError");
 const { parseListParams, buildPagination, pickSort } = require("../utils/listQuery");
+const DEACTIVATED_IN_USE_MESSAGE = "This item is in use and has been deactivated instead";
 
 const parsePositiveNumber = (value, label) => {
   const num = Number(value);
@@ -63,7 +64,15 @@ const upsertRecipe = async (req, res) => {
     }
 
     const variantExists = await req.tenantDB.query(
-      "SELECT id FROM menu_item_variants WHERE id = $1 LIMIT 1",
+      `
+      SELECT v.id
+      FROM menu_item_variants v
+      JOIN menu_items i ON i.id = v.item_id
+      WHERE v.id = $1
+        AND COALESCE(v.is_active, TRUE) = TRUE
+        AND COALESCE(i.is_active, TRUE) = TRUE
+      LIMIT 1
+      `,
       [menu_item_variant_id]
     );
     if (variantExists.rowCount === 0) {
@@ -88,6 +97,7 @@ const upsertRecipe = async (req, res) => {
         SELECT id, name, consumption_unit_id
         FROM raw_materials
         WHERE id = $1
+          AND COALESCE(is_active, TRUE) = TRUE
         LIMIT 1
         `,
         [rawId]
@@ -96,7 +106,7 @@ const upsertRecipe = async (req, res) => {
         return res.status(400).json({ message: "Selected raw material does not exist." });
       }
 
-      const unitExists = await req.tenantDB.query("SELECT id FROM units WHERE id = $1 LIMIT 1", [
+      const unitExists = await req.tenantDB.query("SELECT id FROM units WHERE id = $1 AND COALESCE(is_active, TRUE) = TRUE LIMIT 1", [
         unitId,
       ]);
       if (unitExists.rowCount === 0) {
@@ -113,15 +123,29 @@ const upsertRecipe = async (req, res) => {
 
     await req.tenantDB.query("BEGIN");
 
-    await req.tenantDB.query("DELETE FROM recipe_items WHERE menu_item_variant_id = $1", [
+    await req.tenantDB.query(
+      `
+      UPDATE recipe_items
+      SET is_active = FALSE,
+          updated_at = NOW()
+      WHERE menu_item_variant_id = $1
+      `,
+      [
       menu_item_variant_id,
-    ]);
+      ]
+    );
 
     for (const m of rows) {
       await req.tenantDB.query(
         `
-        INSERT INTO recipe_items (id, menu_item_variant_id, raw_material_id, quantity, unit_id)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO recipe_items (id, menu_item_variant_id, raw_material_id, quantity, unit_id, is_active)
+        VALUES ($1, $2, $3, $4, $5, TRUE)
+        ON CONFLICT (menu_item_variant_id, raw_material_id)
+        DO UPDATE SET
+          quantity = EXCLUDED.quantity,
+          unit_id = EXCLUDED.unit_id,
+          is_active = TRUE,
+          updated_at = NOW()
         `,
         [
           randomUUID(),
@@ -133,16 +157,24 @@ const upsertRecipe = async (req, res) => {
       );
     }
 
-    await req.tenantDB.query("DELETE FROM recipe_steps WHERE menu_item_variant_id = $1", [
+    await req.tenantDB.query(
+      `
+      UPDATE recipe_steps
+      SET is_active = FALSE,
+          updated_at = NOW()
+      WHERE menu_item_variant_id = $1
+      `,
+      [
       menu_item_variant_id,
-    ]);
+      ]
+    );
 
     for (let i = 0; i < normalizedSteps.length; i++) {
       const s = normalizedSteps[i];
       await req.tenantDB.query(
         `
-        INSERT INTO recipe_steps (id, menu_item_variant_id, step_title, step_description, step_order)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO recipe_steps (id, menu_item_variant_id, step_title, step_description, step_order, is_active)
+        VALUES ($1, $2, $3, $4, $5, TRUE)
         `,
         [randomUUID(), menu_item_variant_id, s.step_title, s.step_description, i + 1]
       );
@@ -171,6 +203,8 @@ const getRecipeByVariant = async (req, res) => {
       FROM menu_item_variants v
       JOIN menu_items i ON i.id = v.item_id
       WHERE v.id = $1
+        AND COALESCE(v.is_active, TRUE) = TRUE
+        AND COALESCE(i.is_active, TRUE) = TRUE
       LIMIT 1
       `,
       [variantId]
@@ -193,6 +227,7 @@ const getRecipeByVariant = async (req, res) => {
       JOIN raw_materials rm ON rm.id = ri.raw_material_id
       JOIN units u ON u.id = ri.unit_id
       WHERE ri.menu_item_variant_id = $1
+        AND COALESCE(ri.is_active, TRUE) = TRUE
       ORDER BY rm.name ASC
       `,
       [variantId]
@@ -206,6 +241,7 @@ const getRecipeByVariant = async (req, res) => {
         step_order
       FROM recipe_steps
       WHERE menu_item_variant_id = $1
+        AND COALESCE(is_active, TRUE) = TRUE
       ORDER BY step_order ASC
       `,
       [variantId]
@@ -230,9 +266,7 @@ const listRecipes = async (req, res) => {
     const { sortBy, order } = pickSort(params, ["item_name", "variant_name"], "item_name");
 
     const hasSearch = Boolean(params.search);
-    const where = hasSearch
-      ? "WHERE (i.name ILIKE $1 OR v.name ILIKE $1)"
-      : "";
+    const where = hasSearch ? "AND (i.name ILIKE $1 OR v.name ILIKE $1)" : "";
     const countArgs = hasSearch ? [`%${params.search}%`] : [];
 
     const totalResult = await req.tenantDB.query(
@@ -241,6 +275,9 @@ const listRecipes = async (req, res) => {
       FROM recipe_items ri
       JOIN menu_item_variants v ON v.id = ri.menu_item_variant_id
       JOIN menu_items i ON i.id = v.item_id
+      WHERE COALESCE(ri.is_active, TRUE) = TRUE
+        AND COALESCE(v.is_active, TRUE) = TRUE
+        AND COALESCE(i.is_active, TRUE) = TRUE
       ${where}
       `,
       countArgs
@@ -260,6 +297,9 @@ const listRecipes = async (req, res) => {
       FROM recipe_items ri
       JOIN menu_item_variants v ON v.id = ri.menu_item_variant_id
       JOIN menu_items i ON i.id = v.item_id
+      WHERE COALESCE(ri.is_active, TRUE) = TRUE
+        AND COALESCE(v.is_active, TRUE) = TRUE
+        AND COALESCE(i.is_active, TRUE) = TRUE
       ${where}
       ORDER BY ${sortBy === "variant_name" ? "v.name" : "i.name"} ${order},
                ${sortBy === "variant_name" ? "i.name" : "v.name"} ASC
@@ -294,6 +334,7 @@ const listRecipes = async (req, res) => {
       JOIN raw_materials rm ON rm.id = ri.raw_material_id
       JOIN units u ON u.id = ri.unit_id
       WHERE v.id = ANY($1)
+        AND COALESCE(ri.is_active, TRUE) = TRUE
       ORDER BY i.name ASC, v.name ASC, rm.name ASC
       `,
       [variantIds]
@@ -334,8 +375,45 @@ const listRecipes = async (req, res) => {
 const deleteRecipeByVariant = async (req, res) => {
   const variantId = req.params.variantId;
   try {
-    await req.tenantDB.query("DELETE FROM recipe_items WHERE menu_item_variant_id = $1", [variantId]);
+    const variant = await req.tenantDB.query(
+      `
+      SELECT
+        v.id,
+        i.id AS item_id,
+        COALESCE(v.is_active, TRUE) AS variant_active,
+        COALESCE(i.is_active, TRUE) AS item_active
+      FROM menu_item_variants v
+      JOIN menu_items i ON i.id = v.item_id
+      WHERE v.id = $1
+      LIMIT 1
+      `,
+      [variantId]
+    );
+    if (variant.rowCount === 0) return res.status(404).json({ message: "Recipe not found." });
+    if (variant.rows[0].item_active && variant.rows[0].variant_active) {
+      await req.tenantDB.query(
+        `
+        UPDATE recipe_items
+        SET is_active = FALSE,
+            updated_at = NOW()
+        WHERE menu_item_variant_id = $1
+        `,
+        [variantId]
+      );
+      await req.tenantDB.query(
+        `
+        UPDATE recipe_steps
+        SET is_active = FALSE,
+            updated_at = NOW()
+        WHERE menu_item_variant_id = $1
+        `,
+        [variantId]
+      );
+      return res.status(200).json({ message: DEACTIVATED_IN_USE_MESSAGE });
+    }
+
     await req.tenantDB.query("DELETE FROM recipe_steps WHERE menu_item_variant_id = $1", [variantId]);
+    await req.tenantDB.query("DELETE FROM recipe_items WHERE menu_item_variant_id = $1", [variantId]);
     return res.status(200).json({ message: "Recipe deleted." });
   } catch (error) {
     logError("DELETE /api/recipes/:variantId", error);

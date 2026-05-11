@@ -45,9 +45,13 @@ const nextOrderNumber = async (client) => {
   return `ORD-${String(nextNo).padStart(4, "0")}`;
 };
 
-const ensureTableExists = async (client, tableId) => {
-  const t = await client.query("SELECT id FROM tables WHERE id = $1 LIMIT 1", [tableId]);
-  return t.rowCount > 0;
+const ensureTableForOrder = async (client, tableId) => {
+  const t = await client.query(
+    "SELECT id, is_active FROM tables WHERE id = $1 LIMIT 1",
+    [tableId]
+  );
+  if (t.rowCount === 0) return { exists: false, isActive: false };
+  return { exists: true, isActive: Boolean(t.rows[0]?.is_active) };
 };
 
 const ensureAssignedStaffValid = async (client, assignedStaffId) => {
@@ -101,6 +105,7 @@ const fetchVariantPrices = async (client, variantIds) => {
     SELECT id, price
     FROM menu_item_variants
     WHERE id = ANY($1::uuid[])
+      AND COALESCE(is_active, TRUE) = TRUE
     `,
     [variantIds]
   );
@@ -266,6 +271,22 @@ const startOfRange = (range) => {
   return d;
 };
 
+const parseYmdDate = (value) => {
+  const raw = String(value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+  const [y, m, d] = raw.split("-").map((x) => Number(x));
+  const dt = new Date(y, m - 1, d, 0, 0, 0, 0);
+  if (
+    Number.isNaN(dt.getTime()) ||
+    dt.getFullYear() !== y ||
+    dt.getMonth() !== m - 1 ||
+    dt.getDate() !== d
+  ) {
+    return null;
+  }
+  return dt;
+};
+
 const createOrder = async (req, res) => {
   const { order_type, table_id, items, guest_name, guest_phone, guest_address, tax_percentage, selected_tax_ids, assigned_staff_id } = req.body || {};
   const orderType = String(order_type || "dine_in").trim().toLowerCase();
@@ -295,9 +316,14 @@ const createOrder = async (req, res) => {
           err.statusCode = 400;
           throw err;
         }
-        const ok = await ensureTableExists(client, tableId);
-        if (!ok) {
+        const tableCheck = await ensureTableForOrder(client, tableId);
+        if (!tableCheck.exists) {
           const err = new Error("Selected table does not exist.");
+          err.statusCode = 400;
+          throw err;
+        }
+        if (!tableCheck.isActive) {
+          const err = new Error("Cannot create order on inactive table");
           err.statusCode = 400;
           throw err;
         }
@@ -469,9 +495,14 @@ const updateOrder = async (req, res) => {
           err.statusCode = 400;
           throw err;
         }
-        const ok = await ensureTableExists(client, tableId);
-        if (!ok) {
+        const tableCheck = await ensureTableForOrder(client, tableId);
+        if (!tableCheck.exists) {
           const err = new Error("Selected table does not exist.");
+          err.statusCode = 400;
+          throw err;
+        }
+        if (!tableCheck.isActive) {
+          const err = new Error("Cannot create order on inactive table");
           err.statusCode = 400;
           throw err;
         }
@@ -1445,9 +1476,31 @@ const listOrders = async (req, res) => {
     const args = [];
     const range = String(req.query?.range || "day").trim().toLowerCase();
     const allowedRanges = new Set(["day", "week", "month"]);
-    const rangeStart = startOfRange(allowedRanges.has(range) ? range : "day");
-    args.push(rangeStart);
-    whereParts.push(`o.created_at >= $${args.length}`);
+    const startDateRaw = req.query?.start_date;
+    const endDateRaw = req.query?.end_date;
+    const parsedStart = startDateRaw ? parseYmdDate(startDateRaw) : null;
+    const parsedEnd = endDateRaw ? parseYmdDate(endDateRaw) : null;
+    if ((startDateRaw && !parsedStart) || (endDateRaw && !parsedEnd)) {
+      return res.status(400).json({ message: "Invalid start_date/end_date. Expected YYYY-MM-DD." });
+    }
+    const customStart = parsedStart || parsedEnd;
+    const customEnd = parsedEnd || parsedStart;
+    if (customStart && customEnd && customStart.getTime() > customEnd.getTime()) {
+      return res.status(400).json({ message: "start_date cannot be after end_date." });
+    }
+
+    if (customStart && customEnd) {
+      const customEndExclusive = new Date(customEnd);
+      customEndExclusive.setDate(customEndExclusive.getDate() + 1);
+      args.push(customStart);
+      whereParts.push(`o.created_at >= $${args.length}`);
+      args.push(customEndExclusive);
+      whereParts.push(`o.created_at < $${args.length}`);
+    } else {
+      const rangeStart = startOfRange(allowedRanges.has(range) ? range : "day");
+      args.push(rangeStart);
+      whereParts.push(`o.created_at >= $${args.length}`);
+    }
     if (params.search) {
       args.push(`%${params.search}%`);
       whereParts.push(`(o.order_number ILIKE $${args.length} OR t.name ILIKE $${args.length})`);

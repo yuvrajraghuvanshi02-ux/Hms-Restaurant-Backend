@@ -3,6 +3,8 @@ const { logError } = require("../utils/logError");
 const { parseListParams, buildPagination, pickSort } = require("../utils/listQuery");
 
 const isUniqueViolation = (error) => error?.code === "23505";
+const IN_USE_MESSAGE = "This item is already in use and cannot be deleted";
+const RESTORED_MESSAGE = "This item already existed and has been restored";
 
 const parseNonNegativeNumber = (value, label) => {
   const num = Number(value);
@@ -25,7 +27,7 @@ const validateUniqueVariantNames = (variants) => {
 };
 
 const ensureCategoryExists = async (tenantDB, categoryId) => {
-  const exists = await tenantDB.query("SELECT id FROM menu_categories WHERE id = $1 LIMIT 1", [
+  const exists = await tenantDB.query("SELECT id FROM menu_categories WHERE id = $1 AND is_active = TRUE LIMIT 1", [
     categoryId,
   ]);
   return exists.rowCount > 0;
@@ -36,11 +38,50 @@ const createMenuCategory = async (req, res) => {
   if (!name?.trim()) return res.status(400).json({ message: "Category name is required." });
 
   try {
+    const activeExisting = await req.tenantDB.query(
+      `
+      SELECT id
+      FROM menu_categories
+      WHERE LOWER(name) = LOWER($1)
+        AND COALESCE(is_active, TRUE) = TRUE
+      LIMIT 1
+      `,
+      [name.trim()]
+    );
+    if (activeExisting.rowCount > 0) {
+      return res.status(409).json({ message: "Category already exists." });
+    }
+
+    const inactiveExisting = await req.tenantDB.query(
+      `
+      SELECT id
+      FROM menu_categories
+      WHERE LOWER(name) = LOWER($1)
+        AND COALESCE(is_active, TRUE) = FALSE
+      LIMIT 1
+      `,
+      [name.trim()]
+    );
+    if (inactiveExisting.rowCount > 0) {
+      const restored = await req.tenantDB.query(
+        `
+        UPDATE menu_categories
+        SET name = $1,
+            is_active = TRUE,
+            updated_at = NOW()
+        WHERE id = $2
+        RETURNING id, name, is_active, created_at, updated_at
+        `,
+        [name.trim(), inactiveExisting.rows[0].id]
+      );
+      return res.status(200).json({ message: RESTORED_MESSAGE, data: restored.rows[0] });
+    }
+
     const created = await req.tenantDB.query(
       `
-      INSERT INTO menu_categories (id, name)
-      VALUES ($1, $2)
-      RETURNING id, name, created_at, updated_at
+      INSERT INTO menu_categories (id, name, is_active)
+      VALUES ($1, $2, TRUE)
+      RETURNING id, name, is_active, created_at, updated_at
       `,
       [randomUUID(), name.trim()]
     );
@@ -58,7 +99,7 @@ const listMenuCategories = async (req, res) => {
   try {
     const params = parseListParams(req.query, { defaultSortBy: "name", defaultOrder: "ASC" });
     const { sortBy, order } = pickSort(params, ["name", "created_at", "updated_at"], "name");
-    const where = params.search ? "WHERE name ILIKE $1" : "";
+    const where = params.search ? "WHERE is_active = TRUE AND name ILIKE $1" : "WHERE is_active = TRUE";
     const countArgs = params.search ? [`%${params.search}%`] : [];
 
     const totalResult = await req.tenantDB.query(
@@ -73,7 +114,7 @@ const listMenuCategories = async (req, res) => {
 
     const result = await req.tenantDB.query(
       `
-      SELECT id, name, created_at, updated_at
+      SELECT id, name, is_active, created_at, updated_at
       FROM menu_categories
       ${where}
       ORDER BY ${sortBy} ${order}
@@ -110,7 +151,7 @@ const updateMenuCategory = async (req, res) => {
       SET name = $1,
           updated_at = NOW()
       WHERE id = $2
-      RETURNING id, name, created_at, updated_at
+      RETURNING id, name, is_active, created_at, updated_at
       `,
       [name.trim(), id]
     );
@@ -139,13 +180,19 @@ const deleteMenuCategory = async (req, res) => {
       id,
     ]);
     if (used.rowCount > 0) {
-      return res
-        .status(400)
-        .json({ message: "Cannot delete category, it is linked with menu items" });
+      return res.status(400).json({ message: IN_USE_MESSAGE });
     }
 
-    await req.tenantDB.query("DELETE FROM menu_categories WHERE id = $1", [id]);
-    return res.status(200).json({ message: "Menu category deleted." });
+    await req.tenantDB.query(
+      `
+      UPDATE menu_categories
+      SET is_active = FALSE,
+          updated_at = NOW()
+      WHERE id = $1
+      `,
+      [id]
+    );
+    return res.status(200).json({ message: "Menu category deactivated." });
   } catch (error) {
     logError("DELETE /api/menu/categories/:id", error);
     return res.status(500).json({ message: "Failed to delete menu category." });
@@ -199,8 +246,8 @@ const createMenuItem = async (req, res) => {
 
       const vr = await req.tenantDB.query(
         `
-        INSERT INTO menu_item_variants (id, item_id, name, price)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO menu_item_variants (id, item_id, name, price, is_active)
+        VALUES ($1, $2, $3, $4, TRUE)
         RETURNING id, item_id, name, price, created_at, updated_at
         `,
         [randomUUID(), itemId, vName, vPrice]
@@ -228,7 +275,7 @@ const listMenuItems = async (req, res) => {
   try {
     const params = parseListParams(req.query, { defaultSortBy: "created_at", defaultOrder: "DESC" });
     const { sortBy, order } = pickSort(params, ["created_at", "name"], "created_at");
-    const where = params.search ? "WHERE i.name ILIKE $1" : "";
+    const where = params.search ? "WHERE i.is_active = TRUE AND i.name ILIKE $1" : "WHERE i.is_active = TRUE";
     const countArgs = params.search ? [`%${params.search}%`] : [];
 
     const totalResult = await req.tenantDB.query(
@@ -282,6 +329,7 @@ const listMenuItems = async (req, res) => {
       JOIN menu_categories c ON c.id = i.category_id
       LEFT JOIN menu_item_variants v ON v.item_id = i.id
       WHERE i.id = ANY($1)
+        AND COALESCE(v.is_active, TRUE) = TRUE
       ORDER BY i.${sortBy} ${order}, v.created_at ASC
       `,
       [ids]
@@ -399,6 +447,7 @@ const updateMenuItem = async (req, res) => {
           UPDATE menu_item_variants
           SET name = $1,
               price = $2,
+              is_active = TRUE,
               updated_at = NOW()
           WHERE id = $3 AND item_id = $4
           RETURNING id, item_id, name, price, created_at, updated_at
@@ -409,8 +458,8 @@ const updateMenuItem = async (req, res) => {
       } else {
         const ins = await req.tenantDB.query(
           `
-          INSERT INTO menu_item_variants (id, item_id, name, price)
-          VALUES ($1, $2, $3, $4)
+          INSERT INTO menu_item_variants (id, item_id, name, price, is_active)
+          VALUES ($1, $2, $3, $4, TRUE)
           RETURNING id, item_id, name, price, created_at, updated_at
           `,
           [randomUUID(), id, vName, vPrice]
@@ -421,10 +470,16 @@ const updateMenuItem = async (req, res) => {
 
     const toDelete = [...existingIds].filter((x) => !keepIds.has(x));
     if (toDelete.length > 0) {
-      await req.tenantDB.query("DELETE FROM menu_item_variants WHERE item_id = $1 AND id = ANY($2)", [
-        id,
-        toDelete,
-      ]);
+      await req.tenantDB.query(
+        `
+        UPDATE menu_item_variants
+        SET is_active = FALSE,
+            updated_at = NOW()
+        WHERE item_id = $1
+          AND id = ANY($2)
+        `,
+        [id, toDelete]
+      );
     }
 
     await req.tenantDB.query("COMMIT");
@@ -450,8 +505,39 @@ const deleteMenuItem = async (req, res) => {
     ]);
     if (existing.rowCount === 0) return res.status(404).json({ message: "Item not found." });
 
-    await req.tenantDB.query("DELETE FROM menu_items WHERE id = $1", [id]);
-    return res.status(200).json({ message: "Menu item deleted." });
+    const used = await req.tenantDB.query(
+      `
+      SELECT 1
+      FROM order_items oi
+      JOIN menu_item_variants v ON v.id = oi.variant_id
+      WHERE v.item_id = $1
+      LIMIT 1
+      `,
+      [id]
+    );
+    if (used.rowCount > 0) {
+      return res.status(400).json({ message: IN_USE_MESSAGE });
+    }
+
+    await req.tenantDB.query(
+      `
+      UPDATE menu_items
+      SET is_active = FALSE,
+          updated_at = NOW()
+      WHERE id = $1
+      `,
+      [id]
+    );
+    await req.tenantDB.query(
+      `
+      UPDATE menu_item_variants
+      SET is_active = FALSE,
+          updated_at = NOW()
+      WHERE item_id = $1
+      `,
+      [id]
+    );
+    return res.status(200).json({ message: "Menu item deactivated." });
   } catch (error) {
     logError("DELETE /api/menu/items/:id", error);
     return res.status(500).json({ message: "Failed to delete menu item." });

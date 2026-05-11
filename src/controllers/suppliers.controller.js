@@ -3,6 +3,7 @@ const { logError } = require("../utils/logError");
 const { parseListParams, buildPagination, pickSort } = require("../utils/listQuery");
 
 const isUniqueViolation = (error) => error?.code === "23505";
+const RESTORED_MESSAGE = "This item already existed and has been restored";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_REGEX = /^[\d+\s().-]{8,20}$/;
@@ -98,6 +99,57 @@ const createSupplier = async (req, res) => {
   const acct = trimOrNull(body.bank_account_number);
 
   try {
+    const activeExisting = await req.tenantDB.query(
+      `
+      SELECT id
+      FROM suppliers
+      WHERE LOWER(BTRIM(name::text)) = LOWER(BTRIM($1::text))
+        AND COALESCE(is_active, TRUE) = TRUE
+      LIMIT 1
+      `,
+      [nm]
+    );
+    if (activeExisting.rowCount > 0) {
+      return res.status(409).json({ message: "A supplier with this name already exists." });
+    }
+
+    const inactiveExisting = await req.tenantDB.query(
+      `
+      SELECT id
+      FROM suppliers
+      WHERE LOWER(BTRIM(name::text)) = LOWER(BTRIM($1::text))
+        AND COALESCE(is_active, TRUE) = FALSE
+      LIMIT 1
+      `,
+      [nm]
+    );
+    if (inactiveExisting.rowCount > 0) {
+      const restored = await req.tenantDB.query(
+        `
+        UPDATE suppliers
+        SET
+          name = $1,
+          phone = $2,
+          email = $3,
+          gst_number = $4,
+          contact_person = $5,
+          address = $6,
+          city = $7,
+          state = $8,
+          upi_id = $9,
+          bank_name = $10,
+          bank_ifsc = $11,
+          bank_account_number = $12,
+          is_active = TRUE,
+          updated_at = NOW()
+        WHERE id = $13
+        RETURNING ${supplierColumns}
+        `,
+        [nm, ph, em, gst, contact, addr, city, st, upi, bankName, ifsc, acct, inactiveExisting.rows[0].id]
+      );
+      return res.status(200).json({ message: RESTORED_MESSAGE, data: restored.rows[0] });
+    }
+
     const result = await req.tenantDB.query(
       `
       INSERT INTO suppliers (

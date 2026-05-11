@@ -4,6 +4,8 @@ const { parseListParams, buildPagination, pickSort } = require("../utils/listQue
 
 const isUniqueViolation = (error) => error?.code === "23505";
 const allowedClosingStockTypes = new Set(["daily", "weekly", "monthly", "yearly"]);
+const RESTORED_MESSAGE = "This item already existed and has been restored";
+const DEACTIVATED_IN_USE_MESSAGE = "This item is in use and has been deactivated instead";
 
 const parseNumber = (value, { label, allowNull = false, min = 0, max = null }) => {
   if (value === undefined || value === null || value === "") {
@@ -27,11 +29,50 @@ const createUnit = async (req, res) => {
   }
 
   try {
+    const activeExisting = await req.tenantDB.query(
+      `
+      SELECT id
+      FROM units
+      WHERE (LOWER(name) = LOWER($1) OR LOWER(short_name) = LOWER($2))
+        AND COALESCE(is_active, TRUE) = TRUE
+      LIMIT 1
+      `,
+      [name.trim(), short_name.trim()]
+    );
+    if (activeExisting.rowCount > 0) {
+      return res.status(409).json({ message: "Unit already exists." });
+    }
+
+    const inactiveExisting = await req.tenantDB.query(
+      `
+      SELECT id
+      FROM units
+      WHERE (LOWER(name) = LOWER($1) OR LOWER(short_name) = LOWER($2))
+        AND COALESCE(is_active, TRUE) = FALSE
+      LIMIT 1
+      `,
+      [name.trim(), short_name.trim()]
+    );
+    if (inactiveExisting.rowCount > 0) {
+      const restored = await req.tenantDB.query(
+        `
+        UPDATE units
+        SET name = $1,
+            short_name = $2,
+            is_active = TRUE
+        WHERE id = $3
+        RETURNING id, name, short_name, is_active, created_at
+        `,
+        [name.trim(), short_name.trim(), inactiveExisting.rows[0].id]
+      );
+      return res.status(200).json({ message: RESTORED_MESSAGE, data: restored.rows[0] });
+    }
+
     const result = await req.tenantDB.query(
       `
-      INSERT INTO units (id, name, short_name)
-      VALUES ($1, $2, $3)
-      RETURNING id, name, short_name, created_at
+      INSERT INTO units (id, name, short_name, is_active)
+      VALUES ($1, $2, $3, TRUE)
+      RETURNING id, name, short_name, is_active, created_at
       `,
       [randomUUID(), name.trim(), short_name.trim()]
     );
@@ -49,25 +90,60 @@ const listUnits = async (req, res) => {
   try {
     const params = parseListParams(req.query, { defaultSortBy: "created_at", defaultOrder: "DESC" });
     const { sortBy, order } = pickSort(params, ["created_at", "name", "short_name"], "created_at");
-
-    const where = params.search ? "WHERE name ILIKE $1 OR short_name ILIKE $1" : "";
-    const countArgs = params.search ? [`%${params.search}%`] : [];
+    const active = String(req.query?.active || "").trim().toLowerCase();
+    const whereParts = [];
+    const args = [];
+    if (params.search) {
+      args.push(`%${params.search}%`);
+      whereParts.push(`(u.name ILIKE $${args.length} OR u.short_name ILIKE $${args.length})`);
+    }
+    if (active === "true" || active === "false") {
+      args.push(active === "true");
+      whereParts.push(`u.is_active = $${args.length}`);
+    }
+    const where = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
 
     const totalResult = await req.tenantDB.query(
-      `SELECT COUNT(*)::int AS total FROM units ${where}`,
-      countArgs
+      `SELECT COUNT(*)::int AS total FROM units u ${where}`,
+      args
     );
     const total = totalResult.rows[0]?.total ?? 0;
 
-    const dataArgs = params.search
-      ? [`%${params.search}%`, params.limit, params.offset]
-      : [params.limit, params.offset];
+    const dataArgs = [...args, params.limit, params.offset];
+    const limitIdx = dataArgs.length - 1;
+    const offsetIdx = dataArgs.length;
     const dataQuery = `
-      SELECT id, name, short_name, created_at
-      FROM units
+      SELECT
+        u.id,
+        u.name,
+        u.short_name,
+        u.is_active,
+        u.created_at,
+        NOT EXISTS (
+          SELECT 1
+          FROM (
+            SELECT unit_id AS ref_id FROM raw_materials
+            UNION ALL
+            SELECT purchase_unit_id AS ref_id FROM raw_materials
+            UNION ALL
+            SELECT consumption_unit_id AS ref_id FROM raw_materials
+            UNION ALL
+            SELECT stock_unit_id AS ref_id FROM raw_materials
+            UNION ALL
+            SELECT unit_id AS ref_id FROM recipe_items
+            UNION ALL
+            SELECT unit_id AS ref_id FROM purchase_request_items
+            UNION ALL
+            SELECT unit_id AS ref_id FROM purchase_order_items
+            UNION ALL
+            SELECT unit_id AS ref_id FROM grn_items
+          ) refs
+          WHERE refs.ref_id = u.id
+        ) AS can_delete
+      FROM units u
       ${where}
-      ORDER BY ${sortBy} ${order}
-      LIMIT $${params.search ? 2 : 1} OFFSET $${params.search ? 3 : 2}
+      ORDER BY u.${sortBy} ${order}
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
     `;
     const result = await req.tenantDB.query(dataQuery, dataArgs);
 
@@ -103,7 +179,7 @@ const updateUnit = async (req, res) => {
       UPDATE units
       SET name = $1, short_name = $2
       WHERE id = $3
-      RETURNING id, name, short_name, created_at
+      RETURNING id, name, short_name, is_active, created_at
       `,
       [name.trim(), short_name.trim(), id]
     );
@@ -133,19 +209,38 @@ const deleteUnit = async (req, res) => {
     const used = await req.tenantDB.query(
       `
       SELECT 1
-      FROM raw_materials
-      WHERE unit_id = $1
-         OR purchase_unit_id = $1
-         OR consumption_unit_id = $1
-         OR stock_unit_id = $1
+      FROM (
+        SELECT unit_id AS ref_id FROM raw_materials
+        UNION ALL
+        SELECT purchase_unit_id AS ref_id FROM raw_materials
+        UNION ALL
+        SELECT consumption_unit_id AS ref_id FROM raw_materials
+        UNION ALL
+        SELECT stock_unit_id AS ref_id FROM raw_materials
+        UNION ALL
+        SELECT unit_id AS ref_id FROM recipe_items
+        UNION ALL
+        SELECT unit_id AS ref_id FROM purchase_request_items
+        UNION ALL
+        SELECT unit_id AS ref_id FROM purchase_order_items
+        UNION ALL
+        SELECT unit_id AS ref_id FROM grn_items
+      ) refs
+      WHERE refs.ref_id = $1
       LIMIT 1
       `,
       [id]
     );
     if (used.rowCount > 0) {
-      return res
-        .status(400)
-        .json({ message: "Cannot delete unit, it is linked with raw materials" });
+      await req.tenantDB.query(
+        `
+        UPDATE units
+        SET is_active = FALSE
+        WHERE id = $1
+        `,
+        [id]
+      );
+      return res.status(200).json({ message: DEACTIVATED_IN_USE_MESSAGE });
     }
 
     await req.tenantDB.query("DELETE FROM units WHERE id = $1", [id]);
@@ -217,7 +312,7 @@ const createRawMaterial = async (req, res) => {
     let categoryName = null;
     if (category_id?.trim()) {
       const cat = await req.tenantDB.query(
-        "SELECT id, name FROM raw_material_categories WHERE id = $1 LIMIT 1",
+        "SELECT id, name FROM raw_material_categories WHERE id = $1 AND is_active = TRUE LIMIT 1",
         [category_id]
       );
       if (cat.rowCount === 0) {
@@ -227,17 +322,88 @@ const createRawMaterial = async (req, res) => {
     }
 
     const purchaseUnitExists = await req.tenantDB.query(
-      "SELECT id FROM units WHERE id = $1 LIMIT 1",
+      "SELECT id FROM units WHERE id = $1 AND is_active = TRUE LIMIT 1",
       [purchase_unit_id]
     );
     const consumptionUnitExists = await req.tenantDB.query(
-      "SELECT id FROM units WHERE id = $1 LIMIT 1",
+      "SELECT id FROM units WHERE id = $1 AND is_active = TRUE LIMIT 1",
       [consumption_unit_id]
     );
     if (purchaseUnitExists.rowCount === 0 || consumptionUnitExists.rowCount === 0) {
       return res
         .status(400)
         .json({ message: "Selected purchase/consumption unit does not exist." });
+    }
+
+    const activeExisting = await req.tenantDB.query(
+      `
+      SELECT id
+      FROM raw_materials
+      WHERE LOWER(name) = LOWER($1)
+        AND COALESCE(is_active, TRUE) = TRUE
+      LIMIT 1
+      `,
+      [name.trim()]
+    );
+    if (activeExisting.rowCount > 0) {
+      return res.status(409).json({ message: "Raw material already exists." });
+    }
+
+    const inactiveExisting = await req.tenantDB.query(
+      `
+      SELECT id
+      FROM raw_materials
+      WHERE LOWER(name) = LOWER($1)
+        AND COALESCE(is_active, TRUE) = FALSE
+      LIMIT 1
+      `,
+      [name.trim()]
+    );
+    if (inactiveExisting.rowCount > 0) {
+      const restored = await req.tenantDB.query(
+        `
+        UPDATE raw_materials
+        SET name = $1,
+            category = $2,
+            category_id = $3,
+            unit_id = $4,
+            purchase_unit_id = $4,
+            consumption_unit_id = $5,
+            purchase_price = $6,
+            transfer_price = $7,
+            reconciliation_price = $8,
+            normal_loss_percent = $9,
+            gst_percent = $10,
+            conversion_factor = $11,
+            min_stock_level = $12,
+            min_stock = $12,
+            closing_stock_type = $13,
+            is_active = TRUE,
+            is_expiry = $14,
+            auto_hide_on_low_stock = $15
+        WHERE id = $16
+        RETURNING *
+        `,
+        [
+          name.trim(),
+          categoryName,
+          category_id?.trim() || null,
+          purchase_unit_id,
+          consumption_unit_id,
+          parsed.purchasePrice,
+          parsed.transferPrice,
+          parsed.reconciliationPrice,
+          parsed.normalLossPercent,
+          parsed.gstPercent,
+          parsed.conversionFactor,
+          parsed.minStockLevel,
+          closingType,
+          Boolean(is_expiry),
+          Boolean(auto_hide_on_low_stock),
+          inactiveExisting.rows[0].id,
+        ]
+      );
+      return res.status(200).json({ message: RESTORED_MESSAGE, data: restored.rows[0] });
     }
 
     const result = await req.tenantDB.query(
@@ -259,12 +425,13 @@ const createRawMaterial = async (req, res) => {
         min_stock_level,
         min_stock,
         closing_stock_type,
+        is_active,
         is_expiry,
         auto_hide_on_low_stock
       )
       VALUES (
         $1, $2, $3, $4, $5, $6, $7,
-        $8, $9, $10, $11, $12, $13, $14, $14, $15, $16, $17
+        $8, $9, $10, $11, $12, $13, $14, $14, $15, TRUE, $16, $17
       )
       RETURNING *
       `,
@@ -303,18 +470,28 @@ const listRawMaterials = async (req, res) => {
   try {
     const params = parseListParams(req.query, { defaultSortBy: "created_at", defaultOrder: "DESC" });
     const { sortBy, order } = pickSort(params, ["created_at", "name"], "created_at");
-    const searchWhere = params.search ? "WHERE rm.name ILIKE $1" : "";
-    const countArgs = params.search ? [`%${params.search}%`] : [];
+    const active = String(req.query?.active || "").trim().toLowerCase();
+    const whereParts = [];
+    const args = [];
+    if (params.search) {
+      args.push(`%${params.search}%`);
+      whereParts.push(`rm.name ILIKE $${args.length}`);
+    }
+    if (active === "true" || active === "false") {
+      args.push(active === "true");
+      whereParts.push(`rm.is_active = $${args.length}`);
+    }
+    const searchWhere = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
 
     const totalResult = await req.tenantDB.query(
       `SELECT COUNT(*)::int AS total FROM raw_materials rm ${searchWhere}`,
-      countArgs
+      args
     );
     const total = totalResult.rows[0]?.total ?? 0;
 
-    const dataArgs = params.search
-      ? [`%${params.search}%`, params.limit, params.offset]
-      : [params.limit, params.offset];
+    const dataArgs = [...args, params.limit, params.offset];
+    const limitIdx = dataArgs.length - 1;
+    const offsetIdx = dataArgs.length;
 
     const result = await req.tenantDB.query(
       `
@@ -340,14 +517,27 @@ const listRawMaterials = async (req, res) => {
         rm.closing_stock_type,
         rm.is_expiry,
         rm.auto_hide_on_low_stock,
-        rm.created_at
+        rm.created_at,
+        NOT EXISTS (
+          SELECT 1
+          FROM (
+            SELECT raw_material_id AS ref_id FROM recipe_items
+            UNION ALL
+            SELECT raw_material_id AS ref_id FROM purchase_request_items
+            UNION ALL
+            SELECT raw_material_id AS ref_id FROM purchase_order_items
+            UNION ALL
+            SELECT raw_material_id AS ref_id FROM grn_items
+          ) refs
+          WHERE refs.ref_id = rm.id
+        ) AS can_delete
       FROM raw_materials rm
       LEFT JOIN raw_material_categories c ON c.id = rm.category_id
       LEFT JOIN units pu ON pu.id = rm.purchase_unit_id
       LEFT JOIN units cu ON cu.id = rm.consumption_unit_id
       ${searchWhere}
       ORDER BY rm.${sortBy} ${order}
-      LIMIT $${params.search ? 2 : 1} OFFSET $${params.search ? 3 : 2}
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
       `
       ,
       dataArgs
@@ -424,7 +614,7 @@ const updateRawMaterial = async (req, res) => {
     let categoryName = null;
     if (category_id?.trim()) {
       const cat = await req.tenantDB.query(
-        "SELECT id, name FROM raw_material_categories WHERE id = $1 LIMIT 1",
+        "SELECT id, name FROM raw_material_categories WHERE id = $1 AND is_active = TRUE LIMIT 1",
         [category_id]
       );
       if (cat.rowCount === 0) {
@@ -442,11 +632,11 @@ const updateRawMaterial = async (req, res) => {
     }
 
     const purchaseUnitExists = await req.tenantDB.query(
-      "SELECT id FROM units WHERE id = $1 LIMIT 1",
+      "SELECT id FROM units WHERE id = $1 AND is_active = TRUE LIMIT 1",
       [purchase_unit_id]
     );
     const consumptionUnitExists = await req.tenantDB.query(
-      "SELECT id FROM units WHERE id = $1 LIMIT 1",
+      "SELECT id FROM units WHERE id = $1 AND is_active = TRUE LIMIT 1",
       [consumption_unit_id]
     );
     if (purchaseUnitExists.rowCount === 0 || consumptionUnitExists.rowCount === 0) {
@@ -518,6 +708,34 @@ const deleteRawMaterial = async (req, res) => {
     if (existing.rowCount === 0) {
       return res.status(404).json({ message: "Raw material not found." });
     }
+    const used = await req.tenantDB.query(
+      `
+      SELECT 1
+      FROM (
+        SELECT raw_material_id AS ref_id FROM recipe_items
+        UNION ALL
+        SELECT raw_material_id AS ref_id FROM purchase_request_items
+        UNION ALL
+        SELECT raw_material_id AS ref_id FROM purchase_order_items
+        UNION ALL
+        SELECT raw_material_id AS ref_id FROM grn_items
+      ) refs
+      WHERE refs.ref_id = $1
+      LIMIT 1
+      `,
+      [id]
+    );
+    if (used.rowCount > 0) {
+      await req.tenantDB.query(
+        `
+        UPDATE raw_materials
+        SET is_active = FALSE
+        WHERE id = $1
+        `,
+        [id]
+      );
+      return res.status(200).json({ message: DEACTIVATED_IN_USE_MESSAGE });
+    }
     await req.tenantDB.query("DELETE FROM raw_materials WHERE id = $1", [id]);
     return res.status(200).json({ message: "Raw material deleted." });
   } catch (error) {
@@ -526,14 +744,64 @@ const deleteRawMaterial = async (req, res) => {
   }
 };
 
+const updateUnitStatus = async (req, res) => {
+  const { id } = req.params;
+  const { is_active } = req.body || {};
+  if (typeof is_active !== "boolean") {
+    return res.status(400).json({ message: "is_active must be boolean." });
+  }
+  try {
+    const out = await req.tenantDB.query(
+      `
+      UPDATE units
+      SET is_active = $1
+      WHERE id = $2
+      RETURNING id, name, short_name, is_active, created_at
+      `,
+      [is_active, id]
+    );
+    if (out.rowCount === 0) return res.status(404).json({ message: "Unit not found." });
+    return res.status(200).json({ message: "Unit status updated.", data: out.rows[0] });
+  } catch (error) {
+    logError("PATCH /api/inventory/units/:id/status", error);
+    return res.status(500).json({ message: "Failed to update unit status." });
+  }
+};
+
+const updateRawMaterialStatus = async (req, res) => {
+  const { id } = req.params;
+  const { is_active } = req.body || {};
+  if (typeof is_active !== "boolean") {
+    return res.status(400).json({ message: "is_active must be boolean." });
+  }
+  try {
+    const out = await req.tenantDB.query(
+      `
+      UPDATE raw_materials
+      SET is_active = $1
+      WHERE id = $2
+      RETURNING *
+      `,
+      [is_active, id]
+    );
+    if (out.rowCount === 0) return res.status(404).json({ message: "Raw material not found." });
+    return res.status(200).json({ message: "Raw material status updated.", data: out.rows[0] });
+  } catch (error) {
+    logError("PATCH /api/inventory/raw-materials/:id/status", error);
+    return res.status(500).json({ message: "Failed to update raw material status." });
+  }
+};
+
 module.exports = {
   createUnit,
   listUnits,
   updateUnit,
+  updateUnitStatus,
   deleteUnit,
   createRawMaterial,
   listRawMaterials,
   updateRawMaterial,
+  updateRawMaterialStatus,
   deleteRawMaterial,
 };
 
