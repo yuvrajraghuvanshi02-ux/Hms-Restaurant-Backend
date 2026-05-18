@@ -103,7 +103,7 @@ const getSalesReport = async (req, res) => {
         COUNT(*)::int AS total_orders,
         COALESCE(SUM(pt.paid_amount), 0)::numeric AS total_revenue,
         COALESCE(SUM(o.total_amount), 0)::numeric AS total_subtotal,
-        COALESCE(SUM(o.tax_amount), 0)::numeric AS total_tax,
+        COALESCE(SUM(COALESCE(o.total_tax_amount, o.tax_amount, 0)), 0)::numeric AS total_tax,
         COALESCE(SUM(o.discount_amount), 0)::numeric AS total_discount,
         COALESCE(SUM(o.tip_amount), 0)::numeric AS total_tip
       FROM orders o
@@ -180,7 +180,7 @@ const getSalesReport = async (req, res) => {
         COALESCE(o.total_amount, 0)::numeric AS total_amount,
         COALESCE(o.discount_amount, 0)::numeric AS discount_amount,
         COALESCE(o.tip_amount, 0)::numeric AS tip_amount,
-        COALESCE(o.tax_amount, 0)::numeric AS tax_amount,
+        COALESCE(o.total_tax_amount, o.tax_amount, 0)::numeric AS tax_amount,
         COALESCE(pt.paid_amount, 0)::numeric AS paid_amount
       FROM orders o
       LEFT JOIN tables t ON t.id = o.table_id
@@ -1997,7 +1997,7 @@ const getGstSummaryReport = async (req, res) => {
     const outputQ = await req.tenantDB.query(
       `
       SELECT
-        COALESCE(SUM(COALESCE(o.tax_amount, 0)), 0)::numeric AS output_gst
+        COALESCE(SUM(COALESCE(o.total_tax_amount, o.tax_amount, 0)), 0)::numeric AS output_gst
       FROM orders o
       WHERE LOWER(COALESCE(o.status, '')) = 'completed'
         AND o.created_at >= $1
@@ -2023,7 +2023,7 @@ const getGstSummaryReport = async (req, res) => {
         SELECT generate_series($1::date, $2::date, interval '1 day')::date AS d
       ),
       output_daily AS (
-        SELECT o.created_at::date AS d, COALESCE(SUM(COALESCE(o.tax_amount, 0)), 0)::numeric AS gst_collected
+        SELECT o.created_at::date AS d, COALESCE(SUM(COALESCE(o.total_tax_amount, o.tax_amount, 0)), 0)::numeric AS gst_collected
         FROM orders o
         WHERE LOWER(COALESCE(o.status, '')) = 'completed'
           AND o.created_at >= $1
@@ -2054,9 +2054,9 @@ const getGstSummaryReport = async (req, res) => {
       `
       SELECT
         CASE
-          WHEN LOWER(COALESCE(e.key, '')) LIKE '%cgst%' THEN 'CGST'
-          WHEN LOWER(COALESCE(e.key, '')) LIKE '%sgst%' THEN 'SGST'
-          WHEN LOWER(COALESCE(e.key, '')) LIKE '%igst%' THEN 'IGST'
+          WHEN UPPER(COALESCE(e.key, '')) = 'CGST' OR LOWER(COALESCE(e.key, '')) LIKE '%cgst%' THEN 'CGST'
+          WHEN UPPER(COALESCE(e.key, '')) = 'SGST' OR LOWER(COALESCE(e.key, '')) LIKE '%sgst%' THEN 'SGST'
+          WHEN UPPER(COALESCE(e.key, '')) = 'IGST' OR LOWER(COALESCE(e.key, '')) LIKE '%igst%' THEN 'IGST'
           ELSE 'OTHER'
         END AS gst_type,
         COALESCE(
@@ -2080,14 +2080,37 @@ const getGstSummaryReport = async (req, res) => {
 
     const inputBreakdownQ = await req.tenantDB.query(
       `
-      WITH purchase_tax_lines AS (
+      WITH purchase_breakup_lines AS (
+        SELECT
+          CASE
+            WHEN UPPER(COALESCE(e.key, '')) = 'CGST' OR LOWER(COALESCE(e.key, '')) LIKE '%cgst%' THEN 'CGST'
+            WHEN UPPER(COALESCE(e.key, '')) = 'SGST' OR LOWER(COALESCE(e.key, '')) LIKE '%sgst%' THEN 'SGST'
+            WHEN UPPER(COALESCE(e.key, '')) = 'IGST' OR LOWER(COALESCE(e.key, '')) LIKE '%igst%' THEN 'IGST'
+            ELSE 'OTHER'
+          END AS gst_type,
+          COALESCE(
+            SUM(
+              CASE
+                WHEN COALESCE(e.value, '') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN e.value::numeric
+                ELSE 0
+              END
+            ),
+            0
+          )::numeric AS input_gst
+        FROM purchase_orders po
+        LEFT JOIN LATERAL jsonb_each_text(COALESCE(po.tax_breakup, '{}'::jsonb)) e ON TRUE
+        WHERE po.created_at >= $1
+          AND po.created_at < $2
+        GROUP BY gst_type
+      ),
+      purchase_tax_lines AS (
         SELECT
           po.id AS purchase_id,
           po.purchase_total,
           CASE
-            WHEN LOWER(COALESCE(t.name, '')) LIKE '%cgst%' THEN 'CGST'
-            WHEN LOWER(COALESCE(t.name, '')) LIKE '%sgst%' THEN 'SGST'
-            WHEN LOWER(COALESCE(t.name, '')) LIKE '%igst%' THEN 'IGST'
+            WHEN UPPER(COALESCE(t.tax_code, '')) = 'CGST' OR LOWER(COALESCE(t.name, '')) LIKE '%cgst%' THEN 'CGST'
+            WHEN UPPER(COALESCE(t.tax_code, '')) = 'SGST' OR LOWER(COALESCE(t.name, '')) LIKE '%sgst%' THEN 'SGST'
+            WHEN UPPER(COALESCE(t.tax_code, '')) = 'IGST' OR LOWER(COALESCE(t.name, '')) LIKE '%igst%' THEN 'IGST'
             ELSE 'OTHER'
           END AS gst_type,
           COALESCE(t.percentage, 0)::numeric AS percentage
@@ -2096,11 +2119,18 @@ const getGstSummaryReport = async (req, res) => {
         LEFT JOIN taxes t ON tx.tax_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' AND t.id = tx.tax_id::uuid
         WHERE po.created_at >= $1
           AND po.created_at < $2
+          AND (po.tax_breakup IS NULL OR po.tax_breakup = '{}'::jsonb)
       )
-      SELECT
-        gst_type,
-        COALESCE(SUM(COALESCE(purchase_total, 0) * (COALESCE(percentage, 0) / 100.0)), 0)::numeric AS input_gst
-      FROM purchase_tax_lines
+      SELECT gst_type, COALESCE(SUM(input_gst), 0)::numeric AS input_gst
+      FROM (
+        SELECT gst_type, input_gst FROM purchase_breakup_lines
+        UNION ALL
+        SELECT
+          gst_type,
+          COALESCE(SUM(COALESCE(purchase_total, 0) * (COALESCE(percentage, 0) / 100.0)), 0)::numeric AS input_gst
+        FROM purchase_tax_lines
+        GROUP BY gst_type
+      ) combined
       GROUP BY gst_type
       `,
       [startDate, endExclusive]
@@ -2515,7 +2545,9 @@ const getTimeEfficiencyReport = async (req, res) => {
       FROM orders o
       LEFT JOIN tables t ON t.id = o.table_id
       LEFT JOIN staff_users s ON s.id = o.assigned_staff_id
-      WHERE LOWER(COALESCE(o.status, '')) <> 'cancelled'
+      WHERE LOWER(COALESCE(o.status, '')) = 'completed'
+        AND LOWER(COALESCE(o.payment_status, 'unpaid')) = 'paid'
+        AND o.completed_at IS NOT NULL
         AND o.created_at >= $1
         AND o.created_at < $2
       ORDER BY o.created_at DESC
@@ -2549,7 +2581,9 @@ const getTimeEfficiencyReport = async (req, res) => {
           END
         )::numeric AS avg_serve_seconds
       FROM orders o
-      WHERE LOWER(COALESCE(o.status, '')) <> 'cancelled'
+      WHERE LOWER(COALESCE(o.status, '')) = 'completed'
+        AND LOWER(COALESCE(o.payment_status, 'unpaid')) = 'paid'
+        AND o.completed_at IS NOT NULL
         AND o.created_at >= $1
         AND o.created_at < $2
       GROUP BY o.created_at::date

@@ -43,7 +43,7 @@ const createPurchaseOrderFromPr = async (req, res) => {
       const pr = await client.query(
         `
         SELECT id, supplier_id, request_number, status, remarks, is_po_created,
-               purchase_total, gst_percentage, gst_amount, selected_tax_ids
+               purchase_total, gst_percentage, gst_amount, selected_tax_ids, tax_breakup
         FROM purchase_requests
         WHERE id = $1
         LIMIT 1
@@ -98,11 +98,11 @@ const createPurchaseOrderFromPr = async (req, res) => {
         `
         INSERT INTO purchase_orders (
           id, purchase_request_id, supplier_id, po_number, status, remarks,
-          purchase_total, gst_percentage, gst_amount, selected_tax_ids
+          purchase_total, gst_percentage, gst_amount, selected_tax_ids, tax_breakup
         )
-        VALUES ($1, $2, $3, $4, 'created', $5, $6, $7, $8, $9::jsonb)
+        VALUES ($1, $2, $3, $4, 'created', $5, $6, $7, $8, $9::jsonb, $10::jsonb)
         RETURNING id, purchase_request_id, supplier_id, po_number, status, remarks,
-                  purchase_total, gst_percentage, gst_amount, selected_tax_ids, created_at, updated_at
+                  purchase_total, gst_percentage, gst_amount, selected_tax_ids, tax_breakup, created_at, updated_at
         `,
         [
           poId,
@@ -114,6 +114,7 @@ const createPurchaseOrderFromPr = async (req, res) => {
           Number(pr.rows[0].gst_percentage || 0),
           Number(pr.rows[0].gst_amount || 0),
           JSON.stringify(Array.isArray(pr.rows[0].selected_tax_ids) ? pr.rows[0].selected_tax_ids : []),
+          JSON.stringify(pr.rows[0].tax_breakup && typeof pr.rows[0].tax_breakup === "object" ? pr.rows[0].tax_breakup : {}),
         ]
       );
 

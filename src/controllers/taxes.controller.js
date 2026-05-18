@@ -1,8 +1,16 @@
 const { randomUUID } = require("crypto");
 const { logError } = require("../utils/logError");
 const { parseListParams, buildPagination, pickSort } = require("../utils/listQuery");
+const { isReservedTaxCode, isReservedTaxName } = require("../utils/taxComputation");
+
 const RESTORED_MESSAGE = "This item already existed and has been restored";
 const DEACTIVATED_IN_USE_MESSAGE = "This item is in use and has been deactivated instead";
+
+const TAX_SELECT_FIELDS = `
+  id, name, percentage, is_active,
+  is_system, is_mandatory, is_default, tax_code,
+  created_at, updated_at
+`;
 
 const toNonNegative = (value, label) => {
   const n = Number(value);
@@ -14,10 +22,30 @@ const toNonNegative = (value, label) => {
   return n;
 };
 
+const fetchTaxById = async (tenantDB, id) => {
+  const q = await tenantDB.query(
+    `
+    SELECT ${TAX_SELECT_FIELDS}
+    FROM taxes
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [id]
+  );
+  return q.rows[0] || null;
+};
+
+const isSystemTaxRow = (row) => Boolean(row?.is_system) || Boolean(row?.is_mandatory);
+
 const createTax = async (req, res) => {
-  const { name, percentage, is_active } = req.body || {};
+  const { name, percentage, is_active, tax_code } = req.body || {};
   const taxName = String(name || "").trim();
   if (!taxName) return res.status(400).json({ message: "name is required." });
+
+  const requestedCode = String(tax_code || "").trim().toUpperCase();
+  if (isReservedTaxCode(requestedCode) || isReservedTaxName(taxName)) {
+    return res.status(400).json({ message: "CGST and SGST are system taxes and cannot be created manually." });
+  }
 
   try {
     const pct = toNonNegative(percentage, "percentage");
@@ -39,7 +67,7 @@ const createTax = async (req, res) => {
 
     const inactiveExisting = await req.tenantDB.query(
       `
-      SELECT id
+      SELECT id, is_system, is_mandatory
       FROM taxes
       WHERE LOWER(name) = LOWER($1)
         AND COALESCE(is_active, TRUE) = FALSE
@@ -48,6 +76,9 @@ const createTax = async (req, res) => {
       [taxName]
     );
     if (inactiveExisting.rowCount > 0) {
+      if (isSystemTaxRow(inactiveExisting.rows[0])) {
+        return res.status(400).json({ message: "System taxes cannot be recreated or restored manually." });
+      }
       const restored = await req.tenantDB.query(
         `
         UPDATE taxes
@@ -56,7 +87,7 @@ const createTax = async (req, res) => {
             is_active = $3,
             updated_at = NOW()
         WHERE id = $4
-        RETURNING id, name, percentage, is_active, created_at, updated_at
+        RETURNING ${TAX_SELECT_FIELDS}
         `,
         [taxName, pct, active, inactiveExisting.rows[0].id]
       );
@@ -67,7 +98,7 @@ const createTax = async (req, res) => {
       `
       INSERT INTO taxes (id, name, percentage, is_active, created_at, updated_at)
       VALUES ($1, $2, $3, $4, NOW(), NOW())
-      RETURNING id, name, percentage, is_active, created_at, updated_at
+      RETURNING ${TAX_SELECT_FIELDS}
       `,
       [randomUUID(), taxName, pct, active]
     );
@@ -82,13 +113,13 @@ const createTax = async (req, res) => {
 const listTaxes = async (req, res) => {
   try {
     const params = parseListParams(req.query, { defaultSortBy: "created_at", defaultOrder: "DESC" });
-    const { sortBy, order } = pickSort(params, ["created_at", "name", "percentage"], "created_at");
+    const { sortBy, order } = pickSort(params, ["created_at", "name", "percentage", "tax_code"], "created_at");
     const active = String(req.query?.active || "").trim().toLowerCase();
     const whereParts = [];
     const args = [];
     if (params.search) {
       args.push(`%${params.search}%`);
-      whereParts.push(`name ILIKE $${args.length}`);
+      whereParts.push(`(name ILIKE $${args.length} OR tax_code ILIKE $${args.length})`);
     }
     if (active === "true" || active === "false") {
       args.push(active === "true");
@@ -104,16 +135,27 @@ const listTaxes = async (req, res) => {
     const offsetIdx = dataArgs.length;
     const dataQ = await req.tenantDB.query(
       `
-      SELECT id, name, percentage, is_active, created_at, updated_at
-      , NOT EXISTS (
-          SELECT 1
-          FROM orders o
-          WHERE o.selected_tax_ids @> to_jsonb(ARRAY[taxes.id::text]::text[])
-          LIMIT 1
-        ) AS can_delete
+      SELECT ${TAX_SELECT_FIELDS},
+        CASE
+          WHEN COALESCE(is_system, FALSE) = TRUE OR COALESCE(is_mandatory, FALSE) = TRUE THEN FALSE
+          WHEN NOT EXISTS (
+            SELECT 1
+            FROM orders o
+            WHERE o.selected_tax_ids @> to_jsonb(ARRAY[taxes.id::text]::text[])
+            LIMIT 1
+          ) THEN TRUE
+          ELSE FALSE
+        END AS can_delete
       FROM taxes
       ${where}
-      ORDER BY ${sortBy} ${order}
+      ORDER BY
+        CASE WHEN COALESCE(is_system, FALSE) THEN 0 ELSE 1 END,
+        CASE UPPER(COALESCE(tax_code, ''))
+          WHEN 'CGST' THEN 1
+          WHEN 'SGST' THEN 2
+          ELSE 99
+        END,
+        ${sortBy} ${order}
       LIMIT $${limitIdx} OFFSET $${offsetIdx}
       `,
       dataArgs
@@ -131,42 +173,93 @@ const listTaxes = async (req, res) => {
 
 const updateTax = async (req, res) => {
   const { id } = req.params;
-  const { name, percentage, is_active } = req.body || {};
-  const updates = [];
-  const args = [];
-
-  if (name !== undefined) {
-    const taxName = String(name || "").trim();
-    if (!taxName) return res.status(400).json({ message: "name cannot be empty." });
-    args.push(taxName);
-    updates.push(`name = $${args.length}`);
-  }
-  if (percentage !== undefined) {
-    try {
-      args.push(toNonNegative(percentage, "percentage"));
-    } catch (e) {
-      return res.status(e.statusCode || 400).json({ message: e.message });
-    }
-    updates.push(`percentage = $${args.length}`);
-  }
-  if (is_active !== undefined) {
-    args.push(Boolean(is_active));
-    updates.push(`is_active = $${args.length}`);
-  }
-  if (updates.length === 0) return res.status(400).json({ message: "No fields to update." });
+  const { name, percentage, is_active, tax_code, is_system, is_mandatory, is_default } = req.body || {};
 
   try {
+    const existing = await fetchTaxById(req.tenantDB, id);
+    if (!existing) return res.status(404).json({ message: "Tax not found." });
+
+    if (isSystemTaxRow(existing)) {
+      const blocked = [];
+      if (name !== undefined) blocked.push("name");
+      if (is_active !== undefined) blocked.push("is_active");
+      if (tax_code !== undefined) blocked.push("tax_code");
+      if (is_system !== undefined) blocked.push("is_system");
+      if (is_mandatory !== undefined) blocked.push("is_mandatory");
+      if (is_default !== undefined) blocked.push("is_default");
+      if (blocked.length > 0) {
+        return res.status(400).json({
+          message: `System taxes (CGST/SGST): cannot change ${blocked.join(", ")}. Only percentage can be updated.`,
+        });
+      }
+      if (percentage === undefined) {
+        return res.status(400).json({ message: "No fields to update." });
+      }
+
+      let pct;
+      try {
+        pct = toNonNegative(percentage, "percentage");
+      } catch (e) {
+        return res.status(e.statusCode || 400).json({ message: e.message });
+      }
+
+      const out = await req.tenantDB.query(
+        `
+        UPDATE taxes
+        SET percentage = $1, updated_at = NOW()
+        WHERE id = $2
+        RETURNING ${TAX_SELECT_FIELDS}
+        `,
+        [pct, id]
+      );
+      return res.status(200).json({ message: "System tax rate updated.", data: out.rows[0] });
+    }
+
+    if (name !== undefined && isReservedTaxName(name)) {
+      return res.status(400).json({ message: "Reserved tax names (CGST/SGST) cannot be used." });
+    }
+    if (tax_code !== undefined && isReservedTaxCode(tax_code)) {
+      return res.status(400).json({ message: "Reserved tax codes (CGST/SGST) cannot be used." });
+    }
+
+    const updates = [];
+    const args = [];
+
+    if (name !== undefined) {
+      const taxName = String(name || "").trim();
+      if (!taxName) return res.status(400).json({ message: "name cannot be empty." });
+      args.push(taxName);
+      updates.push(`name = $${args.length}`);
+    }
+    if (percentage !== undefined) {
+      try {
+        args.push(toNonNegative(percentage, "percentage"));
+      } catch (e) {
+        return res.status(e.statusCode || 400).json({ message: e.message });
+      }
+      updates.push(`percentage = $${args.length}`);
+    }
+    if (is_active !== undefined) {
+      args.push(Boolean(is_active));
+      updates.push(`is_active = $${args.length}`);
+    }
+    if (tax_code !== undefined) {
+      const code = String(tax_code || "").trim();
+      args.push(code || null);
+      updates.push(`tax_code = $${args.length}`);
+    }
+    if (updates.length === 0) return res.status(400).json({ message: "No fields to update." });
+
     args.push(id);
     const out = await req.tenantDB.query(
       `
       UPDATE taxes
       SET ${updates.join(", ")}, updated_at = NOW()
       WHERE id = $${args.length}
-      RETURNING id, name, percentage, is_active, created_at, updated_at
+      RETURNING ${TAX_SELECT_FIELDS}
       `,
       args
     );
-    if (out.rowCount === 0) return res.status(404).json({ message: "Tax not found." });
     return res.status(200).json({ message: "Tax updated.", data: out.rows[0] });
   } catch (error) {
     logError("PUT /api/taxes/:id", error);
@@ -178,8 +271,11 @@ const updateTax = async (req, res) => {
 const deleteTax = async (req, res) => {
   const { id } = req.params;
   try {
-    const exists = await req.tenantDB.query("SELECT id FROM taxes WHERE id = $1 LIMIT 1", [id]);
-    if (exists.rowCount === 0) return res.status(404).json({ message: "Tax not found." });
+    const existing = await fetchTaxById(req.tenantDB, id);
+    if (!existing) return res.status(404).json({ message: "Tax not found." });
+    if (isSystemTaxRow(existing)) {
+      return res.status(403).json({ message: "System taxes (CGST/SGST) cannot be deleted or disabled." });
+    }
 
     const usedInOrders = await req.tenantDB.query(
       `
@@ -212,4 +308,3 @@ const deleteTax = async (req, res) => {
 };
 
 module.exports = { createTax, listTaxes, updateTax, deleteTax };
-

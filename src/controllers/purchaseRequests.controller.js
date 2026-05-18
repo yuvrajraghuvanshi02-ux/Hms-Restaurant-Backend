@@ -34,38 +34,7 @@ const toNonNegativeNumber = (value, label) => {
   return n;
 };
 
-const normalizeTaxIds = (value) => {
-  const arr = Array.isArray(value) ? value : [];
-  const seen = new Set();
-  const out = [];
-  for (const v of arr) {
-    const s = String(v || "").trim();
-    if (!s || seen.has(s)) continue;
-    seen.add(s);
-    out.push(s);
-  }
-  return out;
-};
-
-const computePurchaseTaxesFromSelection = async (client, subtotal, selectedTaxIds) => {
-  const ids = normalizeTaxIds(selectedTaxIds);
-  if (!ids.length) {
-    return { selectedTaxIds: [], gstPercentage: 0, gstAmount: 0 };
-  }
-  const q = await client.query(
-    `
-    SELECT id, percentage
-    FROM taxes
-    WHERE id = ANY($1::uuid[]) AND is_active = TRUE
-    `,
-    [ids]
-  );
-  const rows = q.rows || [];
-  const selected = rows.map((r) => String(r.id));
-  const gstPercentage = rows.reduce((sum, row) => sum + Number(row.percentage || 0), 0);
-  const gstAmount = (Number(subtotal || 0) * gstPercentage) / 100;
-  return { selectedTaxIds: selected, gstPercentage, gstAmount };
-};
+const { normalizeTaxIds, computePurchaseTaxes } = require("../utils/taxComputation");
 
 const withTenantTx = async (tenantPool, fn) => {
   const client = await tenantPool.connect();
@@ -209,20 +178,11 @@ const createPurchaseRequest = async (req, res) => {
         const unitPrice = Number(material?.purchase_price || 0);
         return sum + Number(it.quantity || 0) * unitPrice;
       }, 0);
-      let computedSelectedTaxIds = normalizeTaxIds(selected_tax_ids);
-      let computedGstPercentage = Number(gstPercentage || 0);
-      let gstAmount = (purchaseTotal * computedGstPercentage) / 100;
-
-      if (computedSelectedTaxIds.length) {
-        const fromSelection = await computePurchaseTaxesFromSelection(
-          client,
-          purchaseTotal,
-          computedSelectedTaxIds
-        );
-        computedSelectedTaxIds = fromSelection.selectedTaxIds;
-        computedGstPercentage = fromSelection.gstPercentage;
-        gstAmount = fromSelection.gstAmount;
-      }
+      const purchaseTax = await computePurchaseTaxes(client, purchaseTotal, selected_tax_ids);
+      const computedSelectedTaxIds = purchaseTax.selectedTaxIds;
+      const computedGstPercentage = purchaseTax.gstPercentage;
+      const gstAmount = purchaseTax.gstAmount;
+      const taxBreakup = purchaseTax.taxBreakup || {};
 
       const requestId = randomUUID();
       const createdBy = req.user?.id ? String(req.user.id).trim() : null;
@@ -232,11 +192,11 @@ const createPurchaseRequest = async (req, res) => {
         `
         INSERT INTO purchase_requests (
           id, supplier_id, request_number, status, remarks, created_by,
-          purchase_total, gst_percentage, gst_amount, selected_tax_ids
+          purchase_total, gst_percentage, gst_amount, selected_tax_ids, tax_breakup
         )
-        VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9::jsonb)
+        VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb)
         RETURNING id, supplier_id, request_number, status, remarks, created_by,
-                  purchase_total, gst_percentage, gst_amount, selected_tax_ids, created_at, updated_at
+                  purchase_total, gst_percentage, gst_amount, selected_tax_ids, tax_breakup, created_at, updated_at
         `,
         [
           requestId,
@@ -248,6 +208,7 @@ const createPurchaseRequest = async (req, res) => {
           computedGstPercentage,
           gstAmount,
           JSON.stringify(computedSelectedTaxIds),
+          JSON.stringify(taxBreakup),
         ]
       );
 

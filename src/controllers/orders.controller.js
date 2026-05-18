@@ -130,53 +130,10 @@ const toNullableText = (value, maxLen) => {
   return maxLen ? s.slice(0, maxLen) : s;
 };
 
-const computeTax = (subtotal, taxPercentage) => {
-  const sub = Number(subtotal || 0);
-  const tp = Number(taxPercentage || 0);
-  const taxAmount = (sub * tp) / 100;
-  const total = sub + taxAmount;
-  return { taxAmount, total };
-};
-
-const normalizeTaxIds = (value) => {
-  const arr = Array.isArray(value) ? value : [];
-  return Array.from(
-    new Set(
-      arr
-        .map((x) => String(x || "").trim())
-        .filter(Boolean)
-    )
-  );
-};
-
-const computeTaxesFromSelection = async (client, subtotal, selectedTaxIds) => {
-  const sub = Number(subtotal || 0);
-  const ids = normalizeTaxIds(selectedTaxIds);
-  if (ids.length === 0) return { selectedTaxIds: [], taxBreakup: {}, totalTaxAmount: 0, taxPercentage: 0 };
-
-  const q = await client.query(
-    `
-    SELECT id, name, percentage
-    FROM taxes
-    WHERE id = ANY($1::uuid[])
-      AND is_active = TRUE
-    `,
-    [ids]
-  );
-  const rows = q.rows || [];
-  const selected = rows.map((r) => String(r.id));
-  const taxBreakup = {};
-  let totalTaxAmount = 0;
-  let taxPercentage = 0;
-  for (const t of rows) {
-    const pct = Number(t.percentage || 0);
-    const amount = (sub * pct) / 100;
-    taxBreakup[String(t.name || "").trim() || "Tax"] = amount;
-    totalTaxAmount += amount;
-    taxPercentage += pct;
-  }
-  return { selectedTaxIds: selected, taxBreakup, totalTaxAmount, taxPercentage };
-};
+const {
+  normalizeTaxIds,
+  resolveOrderTaxFromSubtotal,
+} = require("../utils/taxComputation");
 
 const recalcOrderTotalsForNonVoidedItems = async (client, orderId, { taxPercentage, selectedTaxIds, totalCost, discountAmount }) => {
   const sums = await client.query(
@@ -197,21 +154,13 @@ const recalcOrderTotalsForNonVoidedItems = async (client, orderId, { taxPercenta
   let outSelectedTaxIds = normalizeTaxIds(selectedTaxIds);
   let outTaxBreakup = {};
   let outTotalTaxAmount = 0;
-  if (outSelectedTaxIds.length > 0) {
-    const tx = await computeTaxesFromSelection(client, subtotal, outSelectedTaxIds);
-    outSelectedTaxIds = tx.selectedTaxIds;
-    outTaxBreakup = tx.taxBreakup;
-    outTotalTaxAmount = Number(tx.totalTaxAmount || 0);
-    outTaxPercentage = Number(tx.taxPercentage || 0);
-    taxAmount = outTotalTaxAmount;
-    total = subtotal + taxAmount;
-  } else {
-    const c = computeTax(subtotal, outTaxPercentage);
-    taxAmount = Number(c.taxAmount || 0);
-    total = Number(c.total || 0);
-    outTaxBreakup = outTaxPercentage > 0 ? { Tax: taxAmount } : {};
-    outTotalTaxAmount = taxAmount;
-  }
+  const resolved = await resolveOrderTaxFromSubtotal(client, subtotal, outSelectedTaxIds, outTaxPercentage);
+  outSelectedTaxIds = resolved.selectedTaxIds;
+  outTaxBreakup = resolved.taxBreakup;
+  outTotalTaxAmount = resolved.totalTaxAmount;
+  outTaxPercentage = resolved.taxPercentage;
+  taxAmount = resolved.taxAmount;
+  total = resolved.total;
   const netRevenue = total - Math.max(0, Number(discountAmount || 0));
   const totalProfit = netRevenue - Number(totalCost || 0);
   return {
@@ -350,25 +299,13 @@ const createOrder = async (req, res) => {
         return { ...it, price, total_price: billableTotalPrice };
       });
 
-      let taxAmount = 0;
-      let total = subtotal;
-      let taxBreakup = {};
-      let totalTaxAmount = 0;
-      if (selectedTaxIds.length > 0) {
-        const tx = await computeTaxesFromSelection(client, subtotal, selectedTaxIds);
-        selectedTaxIds = tx.selectedTaxIds;
-        taxBreakup = tx.taxBreakup;
-        totalTaxAmount = Number(tx.totalTaxAmount || 0);
-        taxPercentage = Number(tx.taxPercentage || 0);
-        taxAmount = totalTaxAmount;
-        total = subtotal + taxAmount;
-      } else {
-        const c = computeTax(subtotal, taxPercentage);
-        taxAmount = Number(c.taxAmount || 0);
-        total = Number(c.total || 0);
-        taxBreakup = taxPercentage > 0 ? { Tax: taxAmount } : {};
-        totalTaxAmount = taxAmount;
-      }
+      const taxResolved = await resolveOrderTaxFromSubtotal(client, subtotal, selectedTaxIds, taxPercentage);
+      selectedTaxIds = taxResolved.selectedTaxIds;
+      const taxBreakup = taxResolved.taxBreakup;
+      const totalTaxAmount = taxResolved.totalTaxAmount;
+      taxPercentage = taxResolved.taxPercentage;
+      const taxAmount = taxResolved.taxAmount;
+      const total = taxResolved.total;
 
       const inserted = await client.query(
         `
@@ -570,27 +507,13 @@ const updateOrder = async (req, res) => {
         subtotal += Number(it.total_price || Number(it.price || 0) * Number(it.quantity || 0));
       }
 
-      let taxAmount = 0;
-      let total = subtotal;
-      let outTaxPercentage = Number(taxPercentage || 0);
-      let outSelectedTaxIds = selectedTaxIds;
-      let taxBreakup = {};
-      let totalTaxAmount = 0;
-      if (outSelectedTaxIds.length > 0) {
-        const tx = await computeTaxesFromSelection(client, subtotal, outSelectedTaxIds);
-        outSelectedTaxIds = tx.selectedTaxIds;
-        outTaxPercentage = Number(tx.taxPercentage || 0);
-        taxBreakup = tx.taxBreakup;
-        totalTaxAmount = Number(tx.totalTaxAmount || 0);
-        taxAmount = totalTaxAmount;
-        total = subtotal + taxAmount;
-      } else {
-        const c = computeTax(subtotal, outTaxPercentage);
-        taxAmount = Number(c.taxAmount || 0);
-        total = Number(c.total || 0);
-        taxBreakup = outTaxPercentage > 0 ? { Tax: taxAmount } : {};
-        totalTaxAmount = taxAmount;
-      }
+      const taxResolved = await resolveOrderTaxFromSubtotal(client, subtotal, selectedTaxIds, taxPercentage);
+      const outSelectedTaxIds = taxResolved.selectedTaxIds;
+      const outTaxPercentage = taxResolved.taxPercentage;
+      const taxBreakup = taxResolved.taxBreakup;
+      const totalTaxAmount = taxResolved.totalTaxAmount;
+      const taxAmount = taxResolved.taxAmount;
+      const total = taxResolved.total;
 
       // Recalculate costing (recipes only) - DO NOT deduct stock here
       let totalCost = 0;
@@ -1298,27 +1221,18 @@ const correctOrder = async (req, res) => {
         if (Boolean(it.is_complimentary)) return s;
         return s + Number(it.total_price || 0);
       }, 0);
-      let taxPercentage = Number(o.tax_percentage || 0);
-      let selectedTaxIds = normalizeTaxIds(o.selected_tax_ids);
-      let taxBreakup = {};
-      let totalTaxAmount = 0;
-      let taxAmount = 0;
-      let total = subtotal;
-      if (selectedTaxIds.length > 0) {
-        const tx = await computeTaxesFromSelection(client, subtotal, selectedTaxIds);
-        selectedTaxIds = tx.selectedTaxIds;
-        taxBreakup = tx.taxBreakup;
-        totalTaxAmount = Number(tx.totalTaxAmount || 0);
-        taxPercentage = Number(tx.taxPercentage || 0);
-        taxAmount = totalTaxAmount;
-        total = subtotal + taxAmount;
-      } else {
-        const c = computeTax(subtotal, taxPercentage);
-        taxAmount = Number(c.taxAmount || 0);
-        total = Number(c.total || 0);
-        taxBreakup = taxPercentage > 0 ? { Tax: taxAmount } : {};
-        totalTaxAmount = taxAmount;
-      }
+      const taxResolved = await resolveOrderTaxFromSubtotal(
+        client,
+        subtotal,
+        o.selected_tax_ids,
+        Number(o.tax_percentage || 0)
+      );
+      const selectedTaxIds = taxResolved.selectedTaxIds;
+      const taxBreakup = taxResolved.taxBreakup;
+      const totalTaxAmount = taxResolved.totalTaxAmount;
+      const taxPercentage = taxResolved.taxPercentage;
+      const taxAmount = taxResolved.taxAmount;
+      const total = taxResolved.total;
 
       // Delete old snapshot rows (after reversing)
       await client.query("DELETE FROM order_item_consumptions WHERE order_id = $1", [id]);
@@ -2175,27 +2089,18 @@ const updateOrderStatus = async (req, res) => {
         );
       }
 
-      let taxPercentage = Number(ord.rows[0]?.tax_percentage || 0);
-      let selectedTaxIds = normalizeTaxIds(ord.rows[0]?.selected_tax_ids);
-      let taxBreakup = {};
-      let totalTaxAmount = 0;
-      let taxAmount = 0;
-      let total = subtotal;
-      if (selectedTaxIds.length > 0) {
-        const tx = await computeTaxesFromSelection(client, subtotal, selectedTaxIds);
-        selectedTaxIds = tx.selectedTaxIds;
-        taxBreakup = tx.taxBreakup;
-        totalTaxAmount = Number(tx.totalTaxAmount || 0);
-        taxPercentage = Number(tx.taxPercentage || 0);
-        taxAmount = totalTaxAmount;
-        total = subtotal + taxAmount;
-      } else {
-        const c = computeTax(subtotal, taxPercentage);
-        taxAmount = Number(c.taxAmount || 0);
-        total = Number(c.total || 0);
-        taxBreakup = taxPercentage > 0 ? { Tax: taxAmount } : {};
-        totalTaxAmount = taxAmount;
-      }
+      const taxResolved = await resolveOrderTaxFromSubtotal(
+        client,
+        subtotal,
+        ord.rows[0]?.selected_tax_ids,
+        Number(ord.rows[0]?.tax_percentage || 0)
+      );
+      const selectedTaxIds = taxResolved.selectedTaxIds;
+      const taxBreakup = taxResolved.taxBreakup;
+      const totalTaxAmount = taxResolved.totalTaxAmount;
+      const taxPercentage = taxResolved.taxPercentage;
+      const taxAmount = taxResolved.taxAmount;
+      const total = taxResolved.total;
       // Profit should reflect net revenue (discount reduces profit, tip does not affect profit)
       const discountAmount = Number(ord.rows[0]?.discount_amount || 0);
       const netRevenue = total - Math.max(0, discountAmount);
