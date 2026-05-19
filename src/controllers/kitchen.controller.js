@@ -54,6 +54,7 @@ const listKitchenOrders = async (req, res) => {
     const itemsQ = await req.tenantDB.query(
       `
       SELECT
+        oi.id,
         oi.order_id,
         oi.variant_id,
         i.name AS item_name,
@@ -61,7 +62,9 @@ const listKitchenOrders = async (req, res) => {
         oi.quantity,
         oi.status,
         oi.is_voided,
-        oi.is_complimentary
+        oi.is_complimentary,
+        oi.is_served,
+        oi.served_at
       FROM order_items oi
       JOIN menu_item_variants v ON v.id = oi.variant_id
       JOIN menu_items i ON i.id = v.item_id
@@ -136,6 +139,7 @@ const listKitchenOrders = async (req, res) => {
     for (const it of items) {
       const arr = itemsByOrder.get(it.order_id) || [];
       arr.push({
+        id: it.id,
         variant_id: it.variant_id,
         item_name: it.item_name,
         variant_name: it.variant_name,
@@ -143,6 +147,8 @@ const listKitchenOrders = async (req, res) => {
         status: it.status,
         is_voided: it.is_voided,
         is_complimentary: it.is_complimentary,
+        is_served: it.is_served,
+        served_at: it.served_at,
         recipe: materialsByVariant.get(it.variant_id) || [],
         steps: stepsByVariant.get(it.variant_id) || [],
       });

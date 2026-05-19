@@ -10,6 +10,12 @@ const { runTenantMigrations } = require("../sequelize/runTenantMigrations");
 const { getTenantSequelize } = require("../orm/tenant");
 const { logError } = require("../utils/logError");
 
+const isProduction = process.env.NODE_ENV === "production";
+const tenantDbUser = isProduction ? process.env.PG_USER : process.env.DB_USER;
+const tenantDbPassword = isProduction ? process.env.PG_PASSWORD : process.env.DB_PASSWORD;
+const tenantDbHost = isProduction ? process.env.PG_HOST : process.env.DB_HOST;
+const tenantDbPort = isProduction ? process.env.PG_PORT : process.env.DB_PORT;
+
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
 
@@ -68,11 +74,11 @@ const createRestaurant = async (req, res) => {
   const normalizedEmail = adminEmail.trim().toLowerCase();
   const dbName = buildTenantDbName();
   const dbConfig = {
-    host: process.env.DB_HOST,
-    port: Number(process.env.DB_PORT),
+    host: tenantDbHost,
+    port: Number(tenantDbPort || 5432),
     database: dbName,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
+    user: tenantDbUser,
+    password: tenantDbPassword,
   };
 
   const restaurantId = randomUUID();

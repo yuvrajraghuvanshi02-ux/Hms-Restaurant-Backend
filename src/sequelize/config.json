@@ -16,11 +16,11 @@
     "dialect": "postgres"
   },
   "production": {
-    "username": "${DB_USER}",
-    "password": "${DB_PASSWORD}",
-    "database": "${DB_NAME}",
-    "host": "${DB_HOST}",
-    "port": "${DB_PORT}",
+    "username": "${PG_USER}",
+    "password": "${PG_PASSWORD}",
+    "database": "${PG_DB}",
+    "host": "${PG_HOST}",
+    "port": "${PG_PORT}",
     "dialect": "postgres"
   }
 }

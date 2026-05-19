@@ -17,6 +17,7 @@ const {
   getOrder,
   getActiveOrderByTable,
   updateOrderStatus,
+  serveOrderItem,
 } = require("../controllers/orders.controller");
 
 const router = express.Router();
@@ -28,6 +29,7 @@ router.get("/", checkPermission("orders", "view"), listOrders);
 router.get("/selectable", checkPermission("orders", "view"), listSelectableOrders);
 router.get("/live", checkPermission("live_orders", "view"), listLiveOrders);
 router.get("/by-table/:table_id", checkPermission("orders", "view"), getActiveOrderByTable);
+router.post("/items/:itemId/serve", checkPermission("orders", "edit"), serveOrderItem);
 router.get("/:id", checkPermission("orders", "view"), getOrder);
 router.put("/:id", checkPermission("orders", "edit"), updateOrder);
 router.patch("/:id/guest", checkPermission("orders", "edit"), updateOrderGuest);

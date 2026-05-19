@@ -1,5 +1,13 @@
 const fs = require("fs");
 const path = require("path");
+const isProduction = process.env.NODE_ENV === "production";
+const resolvedHost = isProduction ? process.env.PG_HOST : process.env.DB_HOST;
+const resolvedPort = isProduction ? process.env.PG_PORT : process.env.DB_PORT;
+const resolvedUser = isProduction ? process.env.PG_USER : process.env.DB_USER;
+const resolvedPassword = isProduction ? process.env.PG_PASSWORD : process.env.DB_PASSWORD;
+const resolvedDatabase = isProduction
+  ? process.env.PG_DB || process.env.PGDATABASE || process.env.DB_NAME || "postgres"
+  : process.env.DB_NAME;
 
 const baseConfigPath = path.join(__dirname, "config.json");
 const raw = JSON.parse(fs.readFileSync(baseConfigPath, "utf8"));
@@ -12,11 +20,11 @@ const expandEnv = (value) => {
 const resolveConfigBlock = (block) => {
   if (!block || typeof block !== "object") return null;
   const dialect = block.dialect || "postgres";
-  const host = expandEnv(block.host) || process.env.DB_HOST;
-  const port = Number(expandEnv(block.port) || process.env.DB_PORT || 5432);
-  const username = expandEnv(block.username) || process.env.DB_USER;
-  const password = expandEnv(block.password) || process.env.DB_PASSWORD;
-  const database = expandEnv(block.database) || process.env.DB_NAME;
+  const host = expandEnv(block.host) || resolvedHost;
+  const port = Number(expandEnv(block.port) || resolvedPort || 5432);
+  const username = expandEnv(block.username) || resolvedUser;
+  const password = expandEnv(block.password) || resolvedPassword;
+  const database = expandEnv(block.database) || resolvedDatabase;
   const dialectOptions = block.dialectOptions;
 
   return {
@@ -34,11 +42,11 @@ const resolveConfigBlock = (block) => {
 const buildConfigForDatabase = (database, baseBlock) => {
   const resolvedBase = resolveConfigBlock(baseBlock) || resolveConfigBlock(raw.development) || {
     dialect: "postgres",
-    host: process.env.DB_HOST,
-    port: Number(process.env.DB_PORT || 5432),
-    username: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
+    host: resolvedHost,
+    port: Number(resolvedPort || 5432),
+    username: resolvedUser,
+    password: resolvedPassword,
+    database: resolvedDatabase,
     logging: false,
   };
 
@@ -60,7 +68,7 @@ module.exports = new Proxy(
       if (explicit) return explicit;
 
       if (envName === "development" || envName === "test" || envName === "production") {
-        return buildConfigForDatabase(process.env.DB_NAME || "postgres", raw[envName] || raw.development);
+        return buildConfigForDatabase(resolvedDatabase || "postgres", raw[envName] || raw.development);
       }
 
       return buildConfigForDatabase(envName, raw.development);

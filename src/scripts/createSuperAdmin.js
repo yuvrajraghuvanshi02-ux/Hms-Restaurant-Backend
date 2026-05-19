@@ -26,6 +26,7 @@ const ensureSuperAdminTable = async () => {
 };
 
 const createSuperAdmin = async () => {
+  // return;
   try {
     await ensureSuperAdminTable();
 

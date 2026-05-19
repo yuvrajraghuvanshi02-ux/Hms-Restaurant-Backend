@@ -1,14 +1,44 @@
 const { Sequelize, DataTypes } = require("sequelize");
+require("dotenv").config();
+
+const isProduction = process.env.NODE_ENV === "production";
+const dbName = isProduction
+  ? process.env.PG_DB || process.env.PGDATABASE || process.env.DB_NAME || "postgres"
+  : process.env.DB_NAME;
+const dbUser = isProduction ? process.env.PG_USER : process.env.DB_USER;
+const dbPassword = isProduction ? process.env.PG_PASSWORD : process.env.DB_PASSWORD;
+const dbHost = isProduction ? process.env.PG_HOST : process.env.DB_HOST;
+const dbPort = isProduction ? process.env.PG_PORT : process.env.DB_PORT;
+const sslEnabled = isProduction;
+
+console.log("Resolved DB Config", {
+  dbName,
+  dbUser,
+  dbHost,
+  dbPort,
+  nodeEnv: process.env.NODE_ENV,
+});
+console.log(`[MASTER DB] NODE_ENV=${process.env.NODE_ENV || "development"} host=${dbHost || "undefined"} ssl=${sslEnabled ? "enabled" : "disabled"}`);
 
 const masterSequelize = new Sequelize(
-  process.env.DB_NAME,
-  process.env.DB_USER,
-  process.env.DB_PASSWORD,
+  dbName,
+  dbUser,
+  dbPassword,
   {
-    host: process.env.DB_HOST,
-    port: Number(process.env.DB_PORT || 5432),
+    host: dbHost,
+    port: Number(dbPort || 5432),
     dialect: "postgres",
     logging: false,
+    ...(sslEnabled
+      ? {
+          dialectOptions: {
+            ssl: {
+              require: true,
+              rejectUnauthorized: false,
+            },
+          },
+        }
+      : {}),
   }
 );
 

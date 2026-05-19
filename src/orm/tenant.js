@@ -1,16 +1,40 @@
 const { Sequelize, DataTypes } = require("sequelize");
+require("dotenv").config();
 
 const tenantSequelizeCache = new Map();
+const isProduction = process.env.NODE_ENV === "production";
 
 const getTenantSequelize = (dbConfig) => {
   const key = `${dbConfig.host}:${dbConfig.port}:${dbConfig.database}:${dbConfig.user}`;
   if (tenantSequelizeCache.has(key)) return tenantSequelizeCache.get(key);
+
+  const sslEnabled = isProduction;
+  console.log("Resolved DB Config", {
+    dbName: dbConfig.database,
+    dbUser: dbConfig.user,
+    dbHost: dbConfig.host,
+    dbPort: dbConfig.port,
+    nodeEnv: process.env.NODE_ENV,
+  });
+  console.log(
+    `[TENANT DB] NODE_ENV=${process.env.NODE_ENV || "development"} host=${dbConfig.host || "undefined"} ssl=${sslEnabled ? "enabled" : "disabled"}`
+  );
 
   const sequelize = new Sequelize(dbConfig.database, dbConfig.user, dbConfig.password, {
     host: dbConfig.host,
     port: Number(dbConfig.port),
     dialect: "postgres",
     logging: false,
+    ...(sslEnabled
+      ? {
+          dialectOptions: {
+            ssl: {
+              require: true,
+              rejectUnauthorized: false,
+            },
+          },
+        }
+      : {}),
   });
 
   const Unit = sequelize.define(

@@ -1,4 +1,5 @@
 const { Pool } = require("pg");
+const isProduction = process.env.NODE_ENV === "production";
 
 const tenantPools = new Map();
 
@@ -14,6 +15,14 @@ const getTenantPool = (tenantDatabaseConfig) => {
         database: tenantDatabaseConfig.database,
         user: tenantDatabaseConfig.user,
         password: tenantDatabaseConfig.password,
+        ...(isProduction
+          ? {
+              ssl: {
+                require: true,
+                rejectUnauthorized: false,
+              },
+            }
+          : {}),
       })
     );
   }

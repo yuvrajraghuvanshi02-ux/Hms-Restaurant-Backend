@@ -1655,6 +1655,7 @@ const listLiveOrders = async (req, res) => {
     const itemsQ = await req.tenantDB.query(
       `
       SELECT
+        oi.id,
         oi.order_id,
         i.name AS item_name,
         v.name AS variant_name,
@@ -1662,7 +1663,9 @@ const listLiveOrders = async (req, res) => {
         oi.status,
         oi.is_voided,
         oi.voided_at,
-        oi.is_complimentary
+        oi.is_complimentary,
+        oi.is_served,
+        oi.served_at
       FROM order_items oi
       JOIN menu_item_variants v ON v.id = oi.variant_id
       JOIN menu_items i ON i.id = v.item_id
@@ -1676,6 +1679,7 @@ const listLiveOrders = async (req, res) => {
     for (const it of itemsQ.rows || []) {
       const arr = itemsByOrder.get(it.order_id) || [];
       arr.push({
+        id: it.id,
         item_name: it.item_name,
         variant_name: it.variant_name,
         quantity: it.quantity,
@@ -1683,6 +1687,8 @@ const listLiveOrders = async (req, res) => {
         is_voided: it.is_voided,
         voided_at: it.voided_at,
         is_complimentary: it.is_complimentary,
+        is_served: it.is_served,
+        served_at: it.served_at,
       });
       itemsByOrder.set(it.order_id, arr);
     }
@@ -1775,7 +1781,10 @@ const getOrder = async (req, res) => {
         oi.is_voided,
         oi.void_reason,
         oi.voided_at,
-        oi.is_complimentary
+        oi.is_complimentary,
+        oi.is_served,
+        oi.served_at,
+        oi.served_by
       FROM order_items oi
       JOIN menu_item_variants v ON v.id = oi.variant_id
       JOIN menu_items i ON i.id = v.item_id
@@ -1868,9 +1877,14 @@ const getActiveOrderByTable = async (req, res) => {
     const items = await req.tenantDB.query(
       `
       SELECT
+        oi.id,
         oi.variant_id,
         oi.quantity,
         oi.price,
+        oi.status,
+        oi.is_voided,
+        oi.is_served,
+        oi.served_at,
         oi.is_complimentary,
         i.name AS item_name,
         v.name AS variant_name
@@ -1902,6 +1916,203 @@ const canTransition = (from, to) => {
   if (from === "ready" && to === "served") return true;
   if (from === "served" && to === "completed") return true;
   return false;
+};
+
+const isActiveOrderItem = (item) => {
+  const status = String(item?.status || "active").toLowerCase();
+  const isVoided = Boolean(item?.is_voided);
+  return (status === "active" || status === "replaced") && !isVoided;
+};
+
+const finalizeOrderAsServed = async (client, orderId, orderRow) => {
+  const items = await client.query(
+    `
+    SELECT id, variant_id, quantity, price, total_price, is_complimentary, status, is_voided, is_served
+    FROM order_items
+    WHERE order_id = $1
+      AND COALESCE(status, 'active') IN ('active', 'replaced')
+      AND COALESCE(is_voided, FALSE) = FALSE
+    FOR UPDATE
+    `,
+    [orderId]
+  );
+  if (items.rowCount === 0) {
+    const err = new Error("Order has no active items.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if ((items.rows || []).some((it) => !Boolean(it?.is_served))) {
+    const err = new Error("All active items must be served before marking order served.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  let subtotal = 0;
+  let totalCost = 0;
+
+  for (const it of items.rows) {
+    const qty = Number(it.quantity);
+    const totalPrice = Number(it.total_price);
+    if (!Boolean(it.is_complimentary)) {
+      subtotal += totalPrice;
+    }
+
+    // Fetch recipe ingredients with raw material pricing/config
+    const recipe = await client.query(
+      `
+      SELECT
+        ri.raw_material_id,
+        ri.quantity AS recipe_quantity,
+        ri.unit_id AS recipe_unit_id,
+        rm.name AS raw_material_name,
+        rm.purchase_price,
+        rm.purchase_unit_id,
+        rm.consumption_unit_id,
+        rm.conversion_factor
+      FROM recipe_items ri
+      JOIN raw_materials rm ON rm.id = ri.raw_material_id
+      WHERE ri.menu_item_variant_id = $1
+      `,
+      [it.variant_id]
+    );
+    if (recipe.rowCount === 0) {
+      const err = new Error("Recipe not found for one or more order items.");
+      err.statusCode = 400;
+      throw err;
+    }
+
+    let itemCost = 0;
+    for (const ing of recipe.rows) {
+      const perUnit = Number(ing.recipe_quantity);
+      if (!Number.isFinite(perUnit) || perUnit <= 0) continue;
+      const reqConsumptionQty = perUnit * qty; // recipe is in consumption unit
+
+      const purchasePrice = Number(ing.purchase_price || 0);
+      const factor = Number(ing.conversion_factor || 1);
+      if (!Number.isFinite(purchasePrice) || purchasePrice < 0) {
+        const err = new Error(`Invalid purchase price for ${ing.raw_material_name}`);
+        err.statusCode = 400;
+        throw err;
+      }
+      if (!Number.isFinite(factor) || factor <= 0) {
+        const err = new Error(`Invalid conversion factor for ${ing.raw_material_name}`);
+        err.statusCode = 400;
+        throw err;
+      }
+
+      // Convert consumption qty → purchase qty when recipe unit is consumption unit.
+      // purchase_qty = consumption_qty / conversion_factor
+      const recipeUnitId = ing.recipe_unit_id;
+      let purchaseQty;
+      if (ing.purchase_unit_id && recipeUnitId === ing.purchase_unit_id) {
+        purchaseQty = reqConsumptionQty;
+      } else if (ing.consumption_unit_id && recipeUnitId === ing.consumption_unit_id) {
+        purchaseQty = reqConsumptionQty / factor;
+      } else {
+        const err = new Error(`Recipe unit mismatch for ${ing.raw_material_name}`);
+        err.statusCode = 400;
+        throw err;
+      }
+
+      itemCost += purchaseQty * purchasePrice;
+    }
+
+    // Deduct stock using existing stock logic (conversion + locking), multiplied by item quantity
+    await deductStockByVariantWithClient(client, it.variant_id, { multiplier: qty });
+
+    // Snapshot consumption in consumption unit for correction flow
+    for (const ing of recipe.rows) {
+      const consumptionQty = toConsumptionQty({
+        recipeQty: ing.recipe_quantity,
+        recipeUnitId: ing.recipe_unit_id,
+        qtyMultiplier: qty,
+        consumptionUnitId: ing.consumption_unit_id,
+        purchaseUnitId: ing.purchase_unit_id,
+        conversionFactor: ing.conversion_factor,
+        rawMaterialName: ing.raw_material_name,
+      });
+
+      if (consumptionQty > 0) {
+        if (!ing.consumption_unit_id) {
+          const err = new Error(`Consumption unit not configured for ${ing.raw_material_name}`);
+          err.statusCode = 400;
+          throw err;
+        }
+        await client.query(
+          `
+          INSERT INTO order_item_consumptions (
+            id, order_id, order_item_id, raw_material_id, quantity_used, created_at
+          )
+          VALUES ($1, $2, $3, $4, $5, NOW())
+          `,
+          [randomUUID(), orderId, it.id, ing.raw_material_id, consumptionQty]
+        );
+      }
+    }
+
+    const profit = totalPrice - itemCost;
+    totalCost += itemCost;
+
+    await client.query(
+      `
+      UPDATE order_items
+      SET cost_price = $1,
+          profit = $2
+      WHERE id = $3
+      `,
+      [itemCost, profit, it.id]
+    );
+  }
+
+  const taxResolved = await resolveOrderTaxFromSubtotal(
+    client,
+    subtotal,
+    orderRow?.selected_tax_ids,
+    Number(orderRow?.tax_percentage || 0)
+  );
+  const selectedTaxIds = taxResolved.selectedTaxIds;
+  const taxBreakup = taxResolved.taxBreakup;
+  const totalTaxAmount = taxResolved.totalTaxAmount;
+  const taxPercentage = taxResolved.taxPercentage;
+  const taxAmount = taxResolved.taxAmount;
+  const total = taxResolved.total;
+  // Profit should reflect net revenue (discount reduces profit, tip does not affect profit)
+  const discountAmount = Number(orderRow?.discount_amount || 0);
+  const netRevenue = total - Math.max(0, discountAmount);
+  const totalProfit = netRevenue - totalCost;
+
+  const updated = await client.query(
+    `
+    UPDATE orders
+    SET status = 'served',
+        total_amount = $1,
+        tax_amount = $2,
+        selected_tax_ids = $3::jsonb,
+        tax_breakup = $4::jsonb,
+        total_tax_amount = $5,
+        tax_percentage = $6,
+        total_cost = $7,
+        total_profit = $8,
+        payment_status = 'unpaid',
+        served_at = COALESCE(served_at, NOW()),
+        updated_at = NOW()
+    WHERE id = $9
+    RETURNING id, order_number, status, kot_sent_at, served_at, completed_at, tax_amount, total_amount, total_cost, total_profit, payment_status, selected_tax_ids, tax_breakup, total_tax_amount, updated_at
+    `,
+    [
+      total,
+      taxAmount,
+      JSON.stringify(selectedTaxIds || []),
+      JSON.stringify(taxBreakup || {}),
+      totalTaxAmount,
+      taxPercentage,
+      totalCost,
+      totalProfit,
+      orderId,
+    ]
+  );
+
+  return updated.rows[0];
 };
 
 const updateOrderStatus = async (req, res) => {
@@ -1956,188 +2167,7 @@ const updateOrderStatus = async (req, res) => {
         return updated.rows[0];
       }
 
-      // Served finalization logic (execute once, inside same tx)
-      const items = await client.query(
-        `
-        SELECT id, variant_id, quantity, price, total_price, is_complimentary
-        FROM order_items
-        WHERE order_id = $1
-          AND COALESCE(status, 'active') = 'active'
-        `,
-        [id]
-      );
-      if (items.rowCount === 0) {
-        const err = new Error("Order has no items.");
-        err.statusCode = 400;
-        throw err;
-      }
-
-      let subtotal = 0;
-      let totalCost = 0;
-
-      for (const it of items.rows) {
-        const qty = Number(it.quantity);
-        const totalPrice = Number(it.total_price);
-        if (!Boolean(it.is_complimentary)) {
-          subtotal += totalPrice;
-        }
-
-        // Fetch recipe ingredients with raw material pricing/config
-        const recipe = await client.query(
-          `
-          SELECT
-            ri.raw_material_id,
-            ri.quantity AS recipe_quantity,
-            ri.unit_id AS recipe_unit_id,
-            rm.name AS raw_material_name,
-            rm.purchase_price,
-            rm.purchase_unit_id,
-            rm.consumption_unit_id,
-            rm.conversion_factor
-          FROM recipe_items ri
-          JOIN raw_materials rm ON rm.id = ri.raw_material_id
-          WHERE ri.menu_item_variant_id = $1
-          `,
-          [it.variant_id]
-        );
-        if (recipe.rowCount === 0) {
-          const err = new Error("Recipe not found for one or more order items.");
-          err.statusCode = 400;
-          throw err;
-        }
-
-        let itemCost = 0;
-        for (const ing of recipe.rows) {
-          const perUnit = Number(ing.recipe_quantity);
-          if (!Number.isFinite(perUnit) || perUnit <= 0) continue;
-          const reqConsumptionQty = perUnit * qty; // recipe is in consumption unit
-
-          const purchasePrice = Number(ing.purchase_price || 0);
-          const factor = Number(ing.conversion_factor || 1);
-          if (!Number.isFinite(purchasePrice) || purchasePrice < 0) {
-            const err = new Error(`Invalid purchase price for ${ing.raw_material_name}`);
-            err.statusCode = 400;
-            throw err;
-          }
-          if (!Number.isFinite(factor) || factor <= 0) {
-            const err = new Error(`Invalid conversion factor for ${ing.raw_material_name}`);
-            err.statusCode = 400;
-            throw err;
-          }
-
-          // Convert consumption qty → purchase qty when recipe unit is consumption unit.
-          // purchase_qty = consumption_qty / conversion_factor
-          const recipeUnitId = ing.recipe_unit_id;
-          let purchaseQty;
-          if (ing.purchase_unit_id && recipeUnitId === ing.purchase_unit_id) {
-            purchaseQty = reqConsumptionQty;
-          } else if (ing.consumption_unit_id && recipeUnitId === ing.consumption_unit_id) {
-            purchaseQty = reqConsumptionQty / factor;
-          } else {
-            const err = new Error(`Recipe unit mismatch for ${ing.raw_material_name}`);
-            err.statusCode = 400;
-            throw err;
-          }
-
-          itemCost += purchaseQty * purchasePrice;
-        }
-
-        // Deduct stock using existing stock logic (conversion + locking), multiplied by item quantity
-        await deductStockByVariantWithClient(client, it.variant_id, { multiplier: qty });
-
-        // Snapshot consumption in consumption unit for correction flow
-        for (const ing of recipe.rows) {
-          const consumptionQty = toConsumptionQty({
-            recipeQty: ing.recipe_quantity,
-            recipeUnitId: ing.recipe_unit_id,
-            qtyMultiplier: qty,
-            consumptionUnitId: ing.consumption_unit_id,
-            purchaseUnitId: ing.purchase_unit_id,
-            conversionFactor: ing.conversion_factor,
-            rawMaterialName: ing.raw_material_name,
-          });
-
-          if (consumptionQty > 0) {
-            if (!ing.consumption_unit_id) {
-              const err = new Error(`Consumption unit not configured for ${ing.raw_material_name}`);
-              err.statusCode = 400;
-              throw err;
-            }
-            await client.query(
-              `
-              INSERT INTO order_item_consumptions (
-                id, order_id, order_item_id, raw_material_id, quantity_used, created_at
-              )
-              VALUES ($1, $2, $3, $4, $5, NOW())
-              `,
-              [randomUUID(), id, it.id, ing.raw_material_id, consumptionQty]
-            );
-          }
-        }
-
-        const profit = totalPrice - itemCost;
-        totalCost += itemCost;
-
-        await client.query(
-          `
-          UPDATE order_items
-          SET cost_price = $1,
-              profit = $2
-          WHERE id = $3
-          `,
-          [itemCost, profit, it.id]
-        );
-      }
-
-      const taxResolved = await resolveOrderTaxFromSubtotal(
-        client,
-        subtotal,
-        ord.rows[0]?.selected_tax_ids,
-        Number(ord.rows[0]?.tax_percentage || 0)
-      );
-      const selectedTaxIds = taxResolved.selectedTaxIds;
-      const taxBreakup = taxResolved.taxBreakup;
-      const totalTaxAmount = taxResolved.totalTaxAmount;
-      const taxPercentage = taxResolved.taxPercentage;
-      const taxAmount = taxResolved.taxAmount;
-      const total = taxResolved.total;
-      // Profit should reflect net revenue (discount reduces profit, tip does not affect profit)
-      const discountAmount = Number(ord.rows[0]?.discount_amount || 0);
-      const netRevenue = total - Math.max(0, discountAmount);
-      const totalProfit = netRevenue - totalCost;
-
-      const updated = await client.query(
-        `
-        UPDATE orders
-        SET status = 'served',
-            total_amount = $1,
-            tax_amount = $2,
-            selected_tax_ids = $3::jsonb,
-            tax_breakup = $4::jsonb,
-            total_tax_amount = $5,
-            tax_percentage = $6,
-            total_cost = $7,
-            total_profit = $8,
-            payment_status = 'unpaid',
-            served_at = COALESCE(served_at, NOW()),
-            updated_at = NOW()
-        WHERE id = $9
-        RETURNING id, order_number, status, kot_sent_at, served_at, completed_at, tax_amount, total_amount, total_cost, total_profit, payment_status, selected_tax_ids, tax_breakup, total_tax_amount, updated_at
-        `,
-        [
-          total,
-          taxAmount,
-          JSON.stringify(selectedTaxIds || []),
-          JSON.stringify(taxBreakup || {}),
-          totalTaxAmount,
-          taxPercentage,
-          totalCost,
-          totalProfit,
-          id,
-        ]
-      );
-
-      return updated.rows[0];
+      return finalizeOrderAsServed(client, id, ord.rows[0]);
     });
 
     return res.status(200).json({ message: "Order status updated.", data: out });
@@ -2146,6 +2176,120 @@ const updateOrderStatus = async (req, res) => {
     return res.status(error.statusCode || 500).json({
       message: error?.message || "Failed to update status.",
     });
+  }
+};
+
+const serveOrderItem = async (req, res) => {
+  const itemId = String(req.params?.itemId || "").trim();
+  if (!itemId) return res.status(400).json({ message: "itemId is required." });
+
+  try {
+    const out = await withTenantTx(req.tenantDB, async (client) => {
+      const itemQ = await client.query(
+        `
+        SELECT
+          oi.id,
+          oi.order_id,
+          oi.status,
+          oi.is_voided,
+          oi.is_served,
+          oi.served_at,
+          o.status AS order_status
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        WHERE oi.id = $1
+        LIMIT 1
+        FOR UPDATE OF oi, o
+        `,
+        [itemId]
+      );
+      if (itemQ.rowCount === 0) {
+        const err = new Error("Order item not found.");
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const item = itemQ.rows[0];
+      const orderStatus = String(item?.order_status || "").toLowerCase();
+      if (orderStatus === "cancelled" || orderStatus === "completed") {
+        const err = new Error("Cannot serve items for cancelled/completed orders.");
+        err.statusCode = 400;
+        throw err;
+      }
+      if (!isActiveOrderItem(item)) {
+        const err = new Error("Only active items can be served.");
+        err.statusCode = 400;
+        throw err;
+      }
+      if (Boolean(item?.is_served)) {
+        const err = new Error("Item is already served.");
+        err.statusCode = 409;
+        throw err;
+      }
+
+      const servedBy = req.user?.id ? String(req.user.id) : null;
+      const updatedItemQ = await client.query(
+        `
+        UPDATE order_items
+        SET is_served = TRUE,
+            served_at = COALESCE(served_at, NOW()),
+            served_by = COALESCE(served_by, $2)
+        WHERE id = $1
+        RETURNING id, order_id, status, is_voided, is_served, served_at, served_by
+        `,
+        [itemId, servedBy]
+      );
+      const updatedItem = updatedItemQ.rows[0];
+
+      const orderItemsQ = await client.query(
+        `
+        SELECT id, status, is_voided, is_served
+        FROM order_items
+        WHERE order_id = $1
+        FOR UPDATE
+        `,
+        [updatedItem.order_id]
+      );
+      const activeItems = (orderItemsQ.rows || []).filter(isActiveOrderItem);
+      const allActiveServed = activeItems.length > 0 && activeItems.every((r) => Boolean(r?.is_served));
+
+      let autoOrderServed = false;
+      let orderSnapshot = null;
+      if (allActiveServed && orderStatus !== "served" && orderStatus !== "completed") {
+        const orderQ = await client.query(
+          `
+          SELECT id, status, tax_percentage, selected_tax_ids, discount_amount, kot_sent_at, served_at, completed_at, payment_status
+          FROM orders
+          WHERE id = $1
+          LIMIT 1
+          FOR UPDATE
+          `,
+          [updatedItem.order_id]
+        );
+        if (orderQ.rowCount > 0) {
+          orderSnapshot = await finalizeOrderAsServed(client, updatedItem.order_id, orderQ.rows[0]);
+          autoOrderServed = true;
+        }
+      }
+
+      return {
+        order_id: updatedItem.order_id,
+        item: updatedItem,
+        all_active_items_served: allActiveServed,
+        auto_order_served: autoOrderServed,
+        order: orderSnapshot,
+      };
+    });
+
+    return res.status(200).json({
+      message: out.auto_order_served
+        ? "Item served. Order auto-marked as served."
+        : "Item served.",
+      data: out,
+    });
+  } catch (error) {
+    logError("POST /api/orders/items/:itemId/serve", error);
+    return res.status(error.statusCode || 500).json({ message: error?.message || "Failed to serve order item." });
   }
 };
 
@@ -2163,5 +2307,6 @@ module.exports = {
   getOrder,
   getActiveOrderByTable,
   updateOrderStatus,
+  serveOrderItem,
 };
 
